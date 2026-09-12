@@ -1,0 +1,15 @@
+{
+  "schema": "mp-publish-release/1",
+  "version": "1.0.5",
+  "launcher_api": 1,
+  "state_version": 1,
+  "projection_version": "skeleton-1",
+  "files": {
+    "runner.py": "daa555ac12e063574326d31734fe3aa730eb36dee12e6d84f70a2f46938f7039",
+    "common.py": "c3bd0df41f1db54c5b6fc440691cca3bba6226a1c7e92fd7b8f3c05e572dbbe9",
+    "collector.py": "0c0570a30a78352fdab68c2ed79794f8362e737a96659d01ab23c2c633d88624",
+    "projection.py": "269269302e6341f0898633b1711c130f4da8920e48f406b02cce4d01e5027e22",
+    "transport.py": "fdefce2bbb6992617e9ebdd20c5712a66c2d9b30f6ae500ff39c7983748f26f4",
+    "validate_report.py": "c187a16804a562deed591c428aaccffa5e6c763029849d6f8904e744d12c10af"
+  }
+}

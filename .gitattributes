@@ -1,0 +1,2 @@
+*.py text eol=lf
+release.json text eol=lf
