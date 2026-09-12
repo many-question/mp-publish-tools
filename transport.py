@@ -14,6 +14,7 @@ from __future__ import annotations
 import argparse
 import datetime
 import gzip
+import hashlib
 import zlib
 import os
 import pathlib
@@ -122,8 +123,8 @@ def check_secrets(files) -> list[str]:
         if f.name.endswith('.jsonl.gz') and f.is_relative_to(SHARE / 'telemetry'):
             try:
                 with gzip.open(f, 'rb') as fh:
-                    raw = fh.read(256*1024 + 1)
-                if len(raw) > 256*1024:
+                    raw = fh.read(64*1024*1024 + 1)
+                if len(raw) > 64*1024*1024:
                     raise ValueError('Telemetry chunk expands beyond its block limit')
                 from projection import check_text
                 for line in raw.decode('utf-8').splitlines():
@@ -190,86 +191,85 @@ def configure(root):
         raise ValueError('share Git state must belong to this workspace')
 
 
+def names(*args):
+    return set(filter(None, git(*args, binary=True).stdout.decode('utf-8').split('\0')))
+
+
+def changed_names(scope=()):
+    return (names('diff', '--name-only', '-z', *scope) |
+            names('diff', '--cached', '--name-only', '-z', *scope) |
+            names('ls-files', '--others', '--exclude-standard', '-z', *scope))
+
+
+def sync_status():
+    branch = git('symbolic-ref', '--short', 'HEAD', check=False).stdout.strip()
+    ref = 'refs/remotes/origin/' + branch
+    head = git('rev-parse', '--verify', 'HEAD', check=False)
+    remote = git('rev-parse', '--verify', ref, check=False)
+    contains = not head.returncode and not remote.returncode and git('merge-base', '--is-ancestor', head.stdout.strip(), ref, check=False).returncode == 0
+    pending = changed_names(('--', 'telemetry'))
+    pending |= names('ls-files', '--others', '--ignored', '--exclude-standard', '-z', '--', 'telemetry')
+    if not contains and not head.returncode:
+        pending |= (names('diff', '--name-only', '-z', ref, 'HEAD', '--', 'telemetry') if not remote.returncode
+                    else names('ls-tree', '-r', '--name-only', '-z', 'HEAD', '--', 'telemetry'))
+    return dict(pending_chunks=len(pending), remote_contains_head=bool(contains),
+                git_observation='cached remote ref; --status does not fetch', remote_ref=ref)
+
+
 def publish(message='', check=False, telemetry_only=False) -> int:
-
-    if not (SHARE / ".git").exists():
-        print(f"错误: {SHARE} 不是一个已配置的仓库。请联系人类研究员。", file=sys.stderr)
-        return 1
-
-    if pathlib.Path(git('rev-parse', '--show-toplevel').stdout.strip()).resolve() != SHARE.resolve():
-        raise ValueError('share Git repository resolved outside the share directory')
-
-    for problem in check_key():
-        print(f"错误: {problem}", file=sys.stderr)
-        return 1
-
-    files = collect_files()
-    if telemetry_only:
-        files = [f for f in files if f.is_relative_to(SHARE / 'telemetry')]
-    hard = check_sizes(files) + check_secrets(files)
-    soft = [] if telemetry_only else check_reports()
-
-    blocking = [m for m in soft if not m.startswith(("提示：", "跳过"))]
-    if blocking:
-        print("汇报格式有问题，请先修正：")
-        for m in blocking:
-            print(f"  - {m}")
-        print()
-    for m in soft:
-        if m.startswith(("提示：", "跳过")):
-            print(m)
-
-    if hard:
-        print("以下问题必须解决后才能推送：", file=sys.stderr)
-        for m in hard:
-            print(f"  - {m}", file=sys.stderr)
-        return 1
-    if blocking:
-        return 1
-
-    if check:
-        print(f"检查通过：share/ 共 {len(files)} 个文件。")
-        return 0
-
     scope = ('--', 'telemetry') if telemetry_only else ()
-    git("add", "-A", *scope)
-    staged = git("diff", "--cached", "--name-only", *scope).stdout.strip()
-    if staged:
-        stamp = datetime.datetime.now().astimezone().strftime("%Y-%m-%d %H:%M")
-        msg = message.strip() or "share update"
-        if telemetry_only:
-            git('commit', '--only', '-m', f'{msg} ({stamp})', '--', 'telemetry')
-        else:
-            git("commit", "-m", f"{msg} ({stamp})")
-
-    branch = git("rev-parse", "--abbrev-ref", "HEAD").stdout.strip()
-    upstream = git("rev-parse", "--abbrev-ref", "@{upstream}", check=False)
-    has_upstream = upstream.returncode == 0
-    if has_upstream:
-        pending = git("log", "--oneline", "@{upstream}..HEAD").stdout.strip()
-        if not staged and not pending:
-            print("share/ 没有变化，也没有待推送的提交。")
-            return 0
-
-    if has_upstream:
-        proc = git("push", check=False)
-    else:
-        proc = git("push", "-u", "origin", branch, check=False)
-    if proc.returncode != 0:
-        print("推送失败：", file=sys.stderr)
-        print('远端未确认本次推送，请检查 share 的网络和认证配置。', file=sys.stderr)
-        print(
-            "\n改动已在本地提交，不会丢失。网络恢复后重新运行本命令即可。",
-            file=sys.stderr,
-        )
+    ignored = names('ls-files', '--others', '--ignored', '--exclude-standard', '-z', '--', 'telemetry')
+    if ignored:
+        print('Telemetry files are ignored by Git; delivery cannot be confirmed.', file=sys.stderr)
         return 1
-
+    selected = changed_names(scope)
+    files = collect_files() if check else [SHARE / n for n in selected if (SHARE / n).exists()]
+    for f in files:
+        if f.is_symlink() or not f.resolve().is_relative_to(SHARE.resolve()) or any(p.is_symlink() for p in f.parents if p != SHARE and p.is_relative_to(SHARE)):
+            raise ValueError('share must not include links to other workspaces')
+    hard = check_key() + check_sizes(files) + check_secrets(files)
+    soft = [] if telemetry_only else check_reports()
+    blocking = [m for m in soft if not m.startswith(('提示：', '跳过'))]
+    if hard or blocking:
+        print('\n'.join(hard + blocking), file=sys.stderr)
+        return 1
+    if check:
+        print(f'检查通过：{len(files)} 个文件。')
+        return 0
+    git('add', '-A', *scope)
+    # Verify the staged telemetry bytes in one index listing, without git show
+    # per chunk. This catches clean filters / EOL conversion before committing.
+    fmt = git('rev-parse', '--show-object-format').stdout.strip()
+    index = {}
+    for entry in git('ls-files', '--stage', '-z', '--', 'telemetry', binary=True).stdout.split(b'\0'):
+        if entry:
+            metadata, name = entry.split(b'\t', 1)
+            mode, oid, stage = metadata.split()
+            index[name.decode('utf-8')] = (mode, oid.decode(), stage)
+    for f in files:
+        rel = f.relative_to(SHARE).as_posix()
+        if not rel.startswith('telemetry/'):
+            continue
+        raw = f.read_bytes()
+        expected = hashlib.new(fmt, b'blob ' + str(len(raw)).encode() + b'\0' + raw).hexdigest()
+        if index.get(rel) != (b'100644', expected, b'0'):
+            raise ValueError('Telemetry was not staged verbatim (check Git filters)')
+    staged = git('diff', '--cached', '--name-only', *scope).stdout.strip()
     if staged:
-        names = staged.splitlines()
-        print("已交付以下文件：")
-        for name in names:
-            print(f"  {name}")
-        print(f"\n共 {len(names)} 项。")
-    else:
-        print("已把之前未推送成功的提交补交上去。")
+        stamp = datetime.datetime.now().astimezone().strftime('%Y-%m-%d %H:%M')
+        git('commit', *(['--only'] if telemetry_only else []), '-m', f'{message.strip() or "share update"} ({stamp})', *scope)
+    head = git('rev-parse', '--verify', 'HEAD', check=False)
+    if head.returncode:
+        print('没有可推送的提交。')
+        return 0
+    commit = head.stdout.strip()
+    branch = git('symbolic-ref', '--short', 'HEAD').stdout.strip()
+    # Retry even a clean working tree: a previous push may have failed.
+    git('push', '-u', 'origin', 'HEAD:refs/heads/' + branch, check=False)
+    ref = 'refs/remotes/origin/' + branch
+    fetched = git('fetch', '--no-tags', 'origin', '+refs/heads/' + branch + ':' + ref, check=False)
+    if fetched.returncode or git('merge-base', '--is-ancestor', commit, ref, check=False).returncode:
+        print('远端尚未确认包含本次提交；本地文件和提交已保留，再次运行即可重试。', file=sys.stderr)
+        return 1
+    print('远端已确认包含提交 ' + commit[:12])
     return 0

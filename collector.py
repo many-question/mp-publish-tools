@@ -1,18 +1,22 @@
-"""Incremental JSONL projection and transactional outbox, private to one workspace."""
+"""Streaming projection with durable local checkpoints; Git owns delivery state."""
 import base64
 import gzip
 import hashlib
 import json
+import os
 from pathlib import Path
 import sqlite3
 import time
 import uuid
+import zlib
 
 from common import atomic, encode, inside, local_state
 from projection import VERSION, check_text, project
 
 MAX_RECORD = 64 * 1024 * 1024
-CHUNK_BYTES = 256 * 1024
+MAX_EXPANDED = 64 * 1024 * 1024
+CHUNK_BYTES = 2 * 1024 * 1024  # compressed output watermark, not input bytes
+FRAGMENT_BYTES = 128 * 1024
 PUBLISHER_RELEASE = hashlib.sha256((Path(__file__).parent / 'release.json').read_bytes()).hexdigest()
 
 
@@ -20,28 +24,84 @@ def sha(data):
     return hashlib.sha256(data).hexdigest()
 
 
-def connect(root):
+def binding(cfg):
+    return encode({k: cfg[k] for k in ('workspace', 'publisher_id', 'run_id', 'framework')}).decode()
+
+
+def connect(root, cfg=None, read_only=False):
     state = local_state(root)
     state.mkdir(parents=True, exist_ok=True)
-    db = sqlite3.connect(inside(root, state / 'state.sqlite'))
+    path = inside(root, state / 'state.sqlite')
+    db = sqlite3.connect(path.as_uri() + '?mode=ro', uri=True) if read_only else sqlite3.connect(path)
     db.row_factory = sqlite3.Row
-    db.execute('PRAGMA synchronous=FULL')
     version = db.execute('PRAGMA user_version').fetchone()[0]
-    if version not in {0, 1}:
-        raise ValueError('Unsupported state version; no migration attempted')
-    db.executescript('''
-        CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
-        CREATE TABLE IF NOT EXISTS sources(
-          id TEXT PRIMARY KEY, path TEXT NOT NULL, generation TEXT NOT NULL,
-          identity TEXT NOT NULL, cursor INTEGER NOT NULL DEFAULT 0,
-          snapshot_end INTEGER NOT NULL, baseline_done INTEGER NOT NULL DEFAULT 0,
-          prefix_n INTEGER NOT NULL DEFAULT 0, prefix_hash TEXT, boundary_hash TEXT,
-          observed_size INTEGER NOT NULL, error TEXT);
-        CREATE TABLE IF NOT EXISTS outbox(
-          id TEXT PRIMARY KEY, data BLOB NOT NULL, sha256 TEXT NOT NULL,
-          exported INTEGER NOT NULL DEFAULT 0, published INTEGER NOT NULL DEFAULT 0);
-        PRAGMA user_version=1;
-    ''')
+    if version not in (0, 1, 2):
+        db.close()
+        raise ValueError('Unsupported state version')
+    if version and cfg:
+        old = db.execute("SELECT value FROM meta WHERE key='binding'").fetchone()
+        empty = not old and version == 2 and all(db.execute('SELECT count(*) FROM ' + table).fetchone()[0] == 0
+                                                for table in ('sources', 'local_files', 'observations'))
+        if not empty and (not old or old[0] != binding(cfg)):
+            db.close()
+            raise ValueError('State belongs to another workspace/run')
+    if read_only:
+        return db
+    db.execute('PRAGMA synchronous=FULL')
+    if version == 1:
+        # A complete SQLite backup precedes the one-way migration. Old runtimes
+        # reject user_version=2 rather than silently consuming the new state.
+        backup = inside(root, state / ('state-v1-' + uuid.uuid4().hex + '.sqlite'))
+        saved = sqlite3.connect(backup)
+        try:
+            db.backup(saved)
+        finally:
+            saved.close()
+    if version == 2:
+        return db
+    try:
+        db.execute("BEGIN IMMEDIATE")
+        with db:
+            db.execute('CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT NOT NULL)')
+            db.execute('''CREATE TABLE IF NOT EXISTS sources(
+              id TEXT PRIMARY KEY, path TEXT NOT NULL, generation TEXT NOT NULL,
+              identity TEXT NOT NULL, cursor INTEGER NOT NULL DEFAULT 0,
+              snapshot_end INTEGER NOT NULL, baseline_done INTEGER NOT NULL DEFAULT 0,
+              prefix_n INTEGER NOT NULL DEFAULT 0, prefix_hash TEXT, boundary_hash TEXT,
+              observed_size INTEGER NOT NULL, error TEXT)''')
+            db.execute('CREATE TABLE IF NOT EXISTS observations(id INTEGER PRIMARY KEY, data BLOB NOT NULL)')
+            # This is ONLY a local file-install journal. No exported/published flags.
+            db.execute('CREATE TABLE IF NOT EXISTS local_files(path TEXT PRIMARY KEY, data BLOB NOT NULL, sha256 TEXT NOT NULL)')
+            if version == 1:
+                if cfg is None:
+                    raise ValueError('Migration requires the verified workspace binding')
+                for row in db.execute('SELECT * FROM outbox WHERE published=0'):
+                    if sha(row['data']) != row['sha256']:
+                        raise ValueError('Legacy outbox checksum mismatch')
+                    folder = Path(root) / 'share/telemetry' / cfg['publisher_id']
+                    plain = inside(root, folder / (row['id'] + '.jsonl'))
+                    gz = inside(root, folder / (row['id'] + '.jsonl.gz'))
+                    if plain.exists() and gz.exists():
+                        raise ValueError('Conflicting legacy delivery paths')
+                    dest = plain if plain.exists() else gz
+                    data = row['data'] if dest == plain else gzip.compress(row['data'], compresslevel=6, mtime=0)
+                    if dest.exists():
+                        existing = dest.read_bytes()
+                        if dest == plain:
+                            restored = existing
+                        else:
+                            with gzip.open(dest, 'rb') as fh:
+                                restored = fh.read(len(row['data']) + 1)
+                        if restored != row['data']:
+                            raise ValueError('Legacy delivery file changed')
+                        data = existing
+                    db.execute('INSERT INTO local_files VALUES (?,?,?)',
+                               (dest.relative_to(Path(root) / 'share').as_posix(), data, sha(data)))
+                db.execute('DROP TABLE outbox')
+            db.execute('PRAGMA user_version=2')
+    except BaseException:
+        db.close()
+        raise
     return db
 
 
@@ -49,261 +109,325 @@ def identity(stat):
     return json.dumps([stat.st_dev, stat.st_ino])
 
 
-def source_path(root, cfg_source):
-    path = Path(cfg_source['path']).resolve(strict=True)
+def source_path(root, source):
+    path = Path(source['path']).resolve(strict=True)
     if not path.is_file() or path.suffix.lower() != '.jsonl':
         raise ValueError('Source must be an explicitly bound JSONL file')
-    # A source may be a native transcript outside the workspace, explicitly bound
-    # by the operator. It must never be our own generated state/output.
     for excluded in (local_state(root), Path(root) / 'share'):
         if path.is_relative_to(excluded.resolve()):
             raise ValueError('Cannot collect publisher state or share as a transcript')
     return path
 
 
-def queue(db, events):
-    parts, current, length = [], [], 0
-    for event in events:
-        event['publisher_release'] = PUBLISHER_RELEASE
-        raw = encode(event)
-        if len(raw) + 1 > CHUNK_BYTES:
-            # User text remains recoverable exactly; no semantic shortening.
-            width = 96 * 1024
-            count = (len(raw) + width - 1) // width
-            records = [encode({'schema': 'mp-event-fragment/1', 'event_sha256': sha(raw),
-                       'part': n, 'parts': count, 'encoding': 'base64',
-                       'data': base64.b64encode(raw[n*width:(n+1)*width]).decode('ascii')})
-                       for n in range(count)]
-        else:
-            records = [raw]
-        for record in records:
-            if current and length + len(record) + 1 > CHUNK_BYTES:
-                parts.append(b''.join(current))
-                current, length = [], 0
-            current.append(record + b'\n')
-            length += len(record) + 1
-    if current:
-        parts.append(b''.join(current))
-    for raw in parts:
-        cid = uuid.uuid4().hex
-        db.execute('INSERT INTO outbox(id,data,sha256) VALUES (?,?,?)', (cid, raw, sha(raw)))
+def observe(db, cfg, src, kind, **extra):
+    event = dict(schema='mp-source-observation/1', run_id=cfg['run_id'],
+                 publisher_id=cfg['publisher_id'], source_id=src['id'], generation=src['generation'],
+                 observation=kind, collected_at=time.time(), projection_version=VERSION, **extra)
+    db.execute('INSERT INTO observations(data) VALUES (?)', (encode(event),))
 
 
 def initialize(root, cfg, db):
-    binding = encode({'workspace': cfg['workspace'], 'publisher_id': cfg['publisher_id'],
-                      'run_id': cfg['run_id'], 'framework': cfg['framework']}).decode()
-    prior = db.execute("SELECT value FROM meta WHERE key='binding'").fetchone()
-    if prior and prior[0] != binding:
-        raise ValueError('State belongs to another workspace/run; refusing shared state')
     with db:
-        db.execute('INSERT OR IGNORE INTO meta VALUES (?,?)', ('binding', binding))
+        prior = db.execute("SELECT value FROM meta WHERE key='binding'").fetchone()
+        if prior and prior[0] != binding(cfg):
+            raise ValueError('State belongs to another workspace/run')
+        db.execute('INSERT OR IGNORE INTO meta VALUES (?,?)', ('binding', binding(cfg)))
         for src in cfg['sources']:
             old = db.execute('SELECT * FROM sources WHERE id=?', (src['id'],)).fetchone()
             if old:
                 if old['path'] != src['path']:
-                    raise ValueError('Existing source binding changed; add a new binding explicitly')
+                    raise ValueError('Source binding changed; add a new source explicitly')
                 continue
             path = source_path(root, src)
             stat = path.stat()
             generation = uuid.uuid4().hex
             db.execute('INSERT INTO sources(id,path,generation,identity,snapshot_end,observed_size) VALUES (?,?,?,?,?,?)',
                        (src['id'], str(path), generation, identity(stat), stat.st_size, stat.st_size))
-            queue(db, [{'schema': 'mp-source-observation/1', 'run_id': cfg['run_id'],
-                'publisher_id': cfg['publisher_id'], 'source_id': src['id'], 'generation': generation,
-                'source_name': path.name,
-                'observation': 'initial_snapshot', 'observed_bytes': stat.st_size,
-                'snapshot_end': stat.st_size, 'collected_at': time.time(), 'projection_version': VERSION}])
+            observe(db, cfg, dict(src, generation=generation), 'initial_snapshot',
+                    source_name=path.name, observed_bytes=stat.st_size, snapshot_end=stat.st_size)
 
 
 def restart_backfill(root, cfg, db):
-    if db.execute('SELECT count(*) FROM outbox WHERE published=0').fetchone()[0]:
-        raise ValueError('Finish pending delivery with --backfill before restarting')
-    snapshots = [(db.execute('SELECT * FROM sources WHERE id=?', (s['id'],)).fetchone(),
-                  source_path(root, s).stat()) for s in cfg['sources']]
     with db:
-        for src, stat in snapshots:
+        for src in cfg['sources']:
+            old = db.execute('SELECT * FROM sources WHERE id=?', (src['id'],)).fetchone()
+            stat = source_path(root, src).stat()
             generation = uuid.uuid4().hex
-            queue(db, [{'schema': 'mp-source-observation/1', 'run_id': cfg['run_id'],
-                'publisher_id': cfg['publisher_id'], 'source_id': src['id'],
-                'generation': generation, 'previous_generation': src['generation'],
-                'observation': 'operator_backfill_restart', 'previous_cursor': src['cursor'],
-                'observed_bytes': stat.st_size, 'snapshot_end': stat.st_size,
-                'collected_at': time.time(), 'projection_version': VERSION}])
+            observe(db, cfg, dict(src, generation=generation), 'operator_backfill_restart',
+                    previous_generation=old['generation'], previous_cursor=old['cursor'],
+                    observed_bytes=stat.st_size, snapshot_end=stat.st_size)
             db.execute('''UPDATE sources SET generation=?,identity=?,cursor=0,snapshot_end=?,
-                observed_size=?,baseline_done=0,prefix_n=0,prefix_hash=NULL,boundary_hash=NULL,
-                error=NULL WHERE id=?''',
+                observed_size=?,baseline_done=0,prefix_n=0,prefix_hash=NULL,boundary_hash=NULL,error=NULL WHERE id=?''',
                 (generation, identity(stat), stat.st_size, stat.st_size, src['id']))
         db.execute("DELETE FROM meta WHERE key='bootstrapped'")
 
 
 def fingerprints(fh, cursor, prefix_n=None):
-    prefix_n = min(cursor, 256) if prefix_n is None else prefix_n
+    pos = fh.tell()
+    n = min(cursor, 256) if prefix_n is None else prefix_n
     fh.seek(0)
-    prefix = sha(fh.read(prefix_n))
+    prefix = sha(fh.read(n))
     fh.seek(max(0, cursor - 256))
     boundary = sha(fh.read(min(256, cursor)))
-    return prefix_n, prefix, boundary
+    fh.seek(pos)
+    return n, prefix, boundary
 
 
-def reset_changed(db, cfg, src, stat, reason):
-    generation = uuid.uuid4().hex
-    with db:
-        queue(db, [{'schema': 'mp-source-observation/1', 'run_id': cfg['run_id'],
-            'publisher_id': cfg['publisher_id'], 'source_id': src['id'],
-            'generation': generation, 'previous_generation': src['generation'],
-            'observation': reason, 'previous_cursor': src['cursor'], 'observed_bytes': stat.st_size,
-            'snapshot_end': stat.st_size, 'collected_at': time.time(), 'projection_version': VERSION}])
-        db.execute('''UPDATE sources SET generation=?,identity=?,cursor=0,snapshot_end=?,
-                      observed_size=?,baseline_done=0,prefix_n=0,prefix_hash=NULL,boundary_hash=NULL,
-                      error='source changed; operator backfill required' WHERE id=?''',
-                   (generation, identity(stat), stat.st_size, stat.st_size, src['id']))
+def materialize(root, db):
+    """Idempotent local recovery. Cursor already has durable compressed bytes in SQLite."""
+    while True:
+        row = db.execute('SELECT * FROM local_files LIMIT 1').fetchone()
+        if row is None:
+            break
+        path = inside(root, Path(root) / 'share' / row['path'])
+        if not path.is_relative_to((Path(root) / 'share/telemetry').resolve()):
+            raise ValueError('Local file journal escaped telemetry')
+        if sha(row['data']) != row['sha256']:
+            raise ValueError('Local checkpoint checksum mismatch')
+        if path.exists():
+            if path.read_bytes() != row['data']:
+                raise ValueError('Local checkpoint has conflicting file contents')
+        else:
+            atomic(path, row['data'])
+        with db:
+            db.execute('DELETE FROM local_files WHERE path=?', (row['path'],))
 
 
-def collect(root, cfg, db, backfill, seconds=3, byte_budget=4*1024*1024):
-    deadline = time.monotonic() + seconds
-    read_bytes = 0
-    bindings = cfg['sources']
-    rotation = db.execute("SELECT value FROM meta WHERE key='next_source'").fetchone()
-    offset = int(rotation[0]) % len(bindings) if rotation and not backfill else 0
-    ordered = bindings[offset:] + bindings[:offset]
-    for bound in ordered:
-        src = db.execute('SELECT * FROM sources WHERE id=?', (bound['id'],)).fetchone()
+class Stream:
+    def __init__(self, root, cfg, db, states, watermark, checkpoint_seconds):
+        self.root, self.cfg, self.db, self.states = root, cfg, db, states
+        self.watermark, self.checkpoint_seconds = watermark, checkpoint_seconds
+        self.file = None
+        self.sealed = []
+        self.in_event = False
+        self.dirty = False
+        self.observation_ids = []
+        self.files = self.compressed = self.expanded_total = 0
+        self.last_checkpoint = time.perf_counter()
+        self.temp = inside(root, local_state(root) / 'scanning.tmp.gz')
+        # A leftover temp was never committed with a cursor; it can be overwritten.
+        if self.temp.exists():
+            self.temp.unlink()
+
+    def open(self):
+        if self.file is None:
+            self.file = self.temp.open('wb')
+            self.encoder = zlib.compressobj(6, zlib.DEFLATED, 31)
+            self.expanded = 0
+
+    def line(self, raw):
+        if self.file and self.expanded + len(raw) > MAX_EXPANDED:
+            self.checkpoint()
+        self.open()
+        self.file.write(self.encoder.compress(raw))
+        self.expanded += len(raw)
+
+    def event(self, event):
+        event['publisher_release'] = PUBLISHER_RELEASE
+        raw = encode(event)
+        if len(raw) > FRAGMENT_BYTES * 1024:
+            raise ValueError('Projected record exceeds the central fragment safety limit; no bytes skipped')
+        self.in_event = True
+        try:
+            if len(raw) <= FRAGMENT_BYTES:
+                self.line(raw + b'\n')
+            else:
+                count = (len(raw) + FRAGMENT_BYTES - 1) // FRAGMENT_BYTES
+                digest = sha(raw)
+                for n in range(count):
+                    fragment = dict(schema='mp-event-fragment/1', event_sha256=digest,
+                                    part=n, parts=count, encoding='base64',
+                                    data=base64.b64encode(raw[n*FRAGMENT_BYTES:(n+1)*FRAGMENT_BYTES]).decode('ascii'))
+                    self.line(encode(fragment) + b'\n')
+                    if self.file.tell() >= self.watermark:
+                        self.checkpoint()
+        finally:
+            self.in_event = False
+
+    def maybe_checkpoint(self):
+        if self.sealed or self.file and (self.file.tell() >= self.watermark or
+                          time.perf_counter()-self.last_checkpoint >= self.checkpoint_seconds):
+            self.checkpoint()
+
+    def checkpoint(self):
+        if self.file:
+            self.file.write(self.encoder.flush())
+            self.file.flush()
+            os.fsync(self.file.fileno())
+            self.file.close()
+            self.file = None
+            raw = self.temp.read_bytes()
+            if len(raw) > 5*1024*1024:
+                raise ValueError('Compressed chunk exceeded 5 MiB file limit')
+            self.sealed.append((raw, self.expanded))
+        # Never commit half an original record. All its fragments and its cursor
+        # enter the same SQLite transaction, even if it spans several gzip files.
+        if self.in_event:
+            return
+        with self.db:
+            for raw, expanded in self.sealed:
+                name = 'telemetry/' + self.cfg['publisher_id'] + '/' + uuid.uuid4().hex + '.jsonl.gz'
+                self.db.execute('INSERT INTO local_files VALUES (?,?,?)', (name, raw, sha(raw)))
+            if self.dirty:
+                for src in self.states.values():
+                    self.db.execute('UPDATE sources SET generation=?,identity=?,cursor=?,snapshot_end=?,baseline_done=?,prefix_n=?,prefix_hash=?,boundary_hash=?,observed_size=?,error=? WHERE id=?',
+                        tuple(src[k] for k in ('generation','identity','cursor','snapshot_end','baseline_done',
+                                              'prefix_n','prefix_hash','boundary_hash','observed_size','error','id')))
+            self.db.executemany('DELETE FROM observations WHERE id=?', [(n,) for n in self.observation_ids])
+        for raw, expanded in self.sealed:
+            self.files += 1
+            self.compressed += len(raw)
+            self.expanded_total += expanded
+        self.sealed = []
+        self.dirty = False
+        self.observation_ids = []
+        materialize(self.root, self.db)
+        if self.temp.exists():
+            self.temp.unlink()
+        self.last_checkpoint = time.perf_counter()
+
+    def close(self):
+        if self.file:
+            self.file.close()
+            self.file = None
+
+
+def collect(root, cfg, db, backfill, seconds=0, byte_budget=None,
+            chunk_bytes=CHUNK_BYTES, checkpoint_seconds=60):
+    """Scan frozen ends continuously; checkpoints never invoke Git/network."""
+    started = time.perf_counter()
+    deadline = started + seconds if seconds else float('inf')
+    materialize(root, db)
+    states = {s['id']: dict(s) for s in db.execute('SELECT * FROM sources')}
+    ends = {}
+    for bound in cfg['sources']:
+        src = states.get(bound['id'])
         if src is None:
             raise ValueError('New source requires --backfill')
-        if backfill and src['baseline_done']:
-            continue
-        if not backfill and not src['baseline_done']:
-            continue
-        if time.monotonic() >= deadline or read_bytes >= byte_budget:
-            break
-        if not backfill:
-            with db:
-                db.execute("INSERT OR REPLACE INTO meta VALUES ('next_source',?)", (str((bindings.index(bound)+1) % len(bindings)),))
+        # Fix all incremental ends at invocation, not after another source finishes.
         try:
-            path = source_path(root, bound)
-            stat = path.stat()
-            with path.open('rb') as fh:
-                changed = identity(stat) != src['identity'] or stat.st_size < src['observed_size']
-                if src['cursor'] and not changed:
-                    _, prefix, boundary = fingerprints(fh, src['cursor'], src['prefix_n'])
-                    changed = prefix != src['prefix_hash'] or boundary != src['boundary_hash']
-                if changed:
-                    reset_changed(db, cfg, src, stat, 'file_identity_or_boundary_changed')
-                    continue
-                end = min(stat.st_size, src['snapshot_end']) if backfill else stat.st_size
-                cursor = src['cursor']
-                events = []
-                tail = False
-                fh.seek(cursor)
-                while cursor < end and read_bytes < byte_budget and time.monotonic() < deadline:
-                    start = cursor
-                    raw = fh.readline(min(MAX_RECORD + 1, end - cursor))
-                    if len(raw) > MAX_RECORD:
-                        raise ValueError('A JSONL record exceeds the 64 MiB limit; no bytes skipped')
-                    if not raw.endswith(b'\n'):
-                        tail = True
+            ends[src['id']] = source_path(root, bound).stat().st_size
+        except OSError:
+            ends[src['id']] = None
+    stream = Stream(root, cfg, db, states, chunk_bytes, checkpoint_seconds)
+    read_bytes = 0
+    budget_end = False
+    try:
+        for row in db.execute('SELECT * FROM observations ORDER BY id').fetchall():
+            stream.event(json.loads(row['data']))
+            stream.observation_ids.append(row['id'])
+            stream.maybe_checkpoint()
+        for bound in cfg['sources']:
+            src = states[bound['id']]
+            if backfill and src['baseline_done']:
+                continue
+            if not backfill and not src['baseline_done']:
+                continue
+            if time.perf_counter() >= deadline:
+                budget_end = True
+                break
+            try:
+                path = source_path(root, bound)
+                stat = path.stat()
+                with path.open('rb') as fh:
+                    changed = identity(stat) != src['identity'] or stat.st_size < src['observed_size']
+                    if src['cursor'] and not changed:
+                        _, prefix, boundary = fingerprints(fh, src['cursor'], src['prefix_n'])
+                        changed = prefix != src['prefix_hash'] or boundary != src['boundary_hash']
+                    if changed:
+                        previous = src['generation']
+                        src.update(generation=uuid.uuid4().hex, identity=identity(stat), cursor=0,
+                                   snapshot_end=stat.st_size, observed_size=stat.st_size, baseline_done=0,
+                                   prefix_n=0, prefix_hash=None, boundary_hash=None,
+                                   error='source changed; operator backfill required')
+                        stream.event(dict(schema='mp-source-observation/1', run_id=cfg['run_id'],
+                            publisher_id=cfg['publisher_id'], source_id=src['id'], generation=src['generation'],
+                            previous_generation=previous, observation='file_identity_or_boundary_changed',
+                            snapshot_end=stat.st_size, collected_at=time.time(), projection_version=VERSION))
+                        stream.dirty = True
+                        continue
+                    if ends[src['id']] is None:
+                        raise ValueError('Source was unavailable at scan start; retry required')
+                    end = min(stat.st_size, src['snapshot_end']) if backfill else min(stat.st_size, ends[src['id']])
+                    start_cursor = cursor = src['cursor']
+                    fh.seek(0)
+                    initial_prefix = fh.read(256)
+                    fh.seek(max(0, cursor-256))
+                    boundary_bytes = fh.read(min(cursor, 256))
+                    fh.seek(cursor)
+                    tail = False
+                    while cursor < end:
+                        if time.perf_counter() >= deadline:
+                            budget_end = True
+                            break
+                        raw = fh.readline(min(MAX_RECORD+1, end-cursor))
+                        if len(raw) > MAX_RECORD:
+                            raise ValueError('A JSONL record exceeds 64 MiB; no bytes skipped')
+                        if not raw.endswith(b'\n'):
+                            tail = True
+                            break
+                        native = json.loads(raw.decode('utf-8'))
+                        event = project(native)
+                        event.update(schema='mp-session-event/1', run_id=cfg['run_id'],
+                            publisher_id=cfg['publisher_id'], framework=cfg['framework'],
+                            source_id=src['id'], generation=src['generation'],
+                            byte_start=cursor, byte_end=cursor+len(raw), collected_at=time.time())
+                        from transport import SECRET_PATTERNS
+                        check_text(encode(event).decode('utf-8'), SECRET_PATTERNS)
+                        stream.event(event)
+                        cursor += len(raw)
+                        read_bytes += len(raw)
+                        src['cursor'] = cursor
+                        # Keep fingerprints correct at any compressed/time checkpoint.
+                        boundary_bytes = raw[-256:] if len(raw) >= 256 else (boundary_bytes + raw)[-256:]
+                        src['prefix_n'] = min(cursor, 256)
+                        src['prefix_hash'] = sha(initial_prefix[:src['prefix_n']])
+                        src['boundary_hash'] = sha(boundary_bytes)
+                        stream.dirty = True
+                        stream.maybe_checkpoint()
+                    after = path.stat()
+                    if identity(after) != src['identity'] or after.st_size < cursor:
+                        raise ValueError('Source changed during scan; operator must retry')
+                    done = cursor >= end or tail
+                    src['observed_size'] = after.st_size
+                    src['error'] = None
+                    if backfill and done:
+                        src['baseline_done'] = 1
+                    stream.dirty = True
+                    if backfill and done or not backfill and cursor != start_cursor:
+                        stream.event(dict(schema='mp-source-observation/1', run_id=cfg['run_id'],
+                            publisher_id=cfg['publisher_id'], source_id=src['id'], generation=src['generation'],
+                            observation='snapshot_scan_finished' if backfill else 'incremental_scan',
+                            snapshot_end=src['snapshot_end'], complete_record_end=cursor,
+                            unframed_tail_bytes=end-cursor if tail else 0,
+                            collected_at=time.time(), projection_version=VERSION))
+                    if budget_end:
                         break
-                    native = json.loads(raw.decode('utf-8'))
-                    event = project(native)
-                    event.update(schema='mp-session-event/1', run_id=cfg['run_id'],
-                                 publisher_id=cfg['publisher_id'], framework=cfg['framework'],
-                                 source_id=src['id'], generation=src['generation'],
-                                 byte_start=start, byte_end=start+len(raw), collected_at=time.time())
-                    text = encode(event).decode('utf-8')
-                    from transport import SECRET_PATTERNS
-                    check_text(text, SECRET_PATTERNS)
-                    events.append(event)
-                    cursor += len(raw)
-                    read_bytes += len(raw)
-                done = backfill and (cursor >= end or tail)
-                prefix_n, prefix, boundary = fingerprints(fh, cursor)
-                # Detect replacement/truncation during the read before committing a cursor.
-                after = path.stat()
-                if identity(after) != identity(stat) or after.st_size < cursor:
-                    raise ValueError('Source changed during read; batch was not committed')
-                if done:
-                    events.append({'schema': 'mp-source-observation/1', 'run_id': cfg['run_id'],
-                        'publisher_id': cfg['publisher_id'], 'source_id': src['id'], 'generation': src['generation'],
-                        'observation': 'snapshot_scan_finished', 'snapshot_end': src['snapshot_end'],
-                        'complete_record_end': cursor, 'unframed_tail_bytes': end-cursor,
-                        'collected_at': time.time(), 'projection_version': VERSION})
-                elif not backfill:
-                    events.append({'schema': 'mp-source-observation/1', 'run_id': cfg['run_id'],
-                        'publisher_id': cfg['publisher_id'], 'source_id': src['id'], 'generation': src['generation'],
-                        'observation': 'incremental_scan', 'read_start': src['cursor'],
-                        'complete_record_end': cursor, 'observed_bytes': after.st_size,
-                        'unframed_tail_observed': tail, 'collected_at': time.time(), 'projection_version': VERSION})
-                with db:
-                    queue(db, events)
-                    db.execute('''UPDATE sources SET cursor=?,prefix_n=?,prefix_hash=?,boundary_hash=?,
-                               observed_size=?,baseline_done=?,error=NULL WHERE id=?''',
-                               (cursor, prefix_n, prefix, boundary, after.st_size,
-                                int(done or src['baseline_done']), src['id']))
-        except (OSError, ValueError, RecursionError) as exc:
-            # No invalid record or secret is printed, exported, or counted as consumed.
-            error = type(exc).__name__ + ': ' + (str(exc) if not isinstance(exc, json.JSONDecodeError) else 'invalid JSON record')
-            with db:
-                if error[:240] != src['error']:
-                    queue(db, [{'schema': 'mp-source-observation/1', 'run_id': cfg['run_id'],
-                        'publisher_id': cfg['publisher_id'], 'source_id': src['id'],
-                        'generation': src['generation'], 'observation': 'read_or_projection_error',
-                        'committed_cursor': src['cursor'], 'error_type': type(exc).__name__,
-                        'error_message': error[:240],
-                        'collected_at': time.time(), 'projection_version': VERSION}])
-                db.execute('UPDATE sources SET error=? WHERE id=?', (error[:240], src['id']))
-    return read_bytes
+            except (OSError, ValueError, RecursionError) as exc:
+                error = 'invalid JSON record' if isinstance(exc, json.JSONDecodeError) else str(exc)
+                src['error'] = type(exc).__name__ + ': ' + error[:240]
+                stream.dirty = True
+                stream.event(dict(schema='mp-source-observation/1', run_id=cfg['run_id'],
+                    publisher_id=cfg['publisher_id'], source_id=src['id'], generation=src['generation'],
+                    observation='read_or_projection_error', committed_cursor=src['cursor'],
+                    error_type=type(exc).__name__, collected_at=time.time(), projection_version=VERSION))
+        stream.checkpoint()
+    finally:
+        stream.close()
+    ready = bool(states) and all(s['baseline_done'] and not s['error'] for s in states.values())
+    if ready:
+        with db:
+            db.execute("INSERT OR REPLACE INTO meta VALUES ('bootstrapped','1')")
+    return dict(raw_bytes=read_bytes, chunks=stream.files, compressed_bytes=stream.compressed,
+                expanded_bytes=stream.expanded_total, scan_seconds=time.perf_counter()-started,
+                budget_exhausted=budget_end)
 
 
 def status(db, cfg):
     rows = [dict(r) for r in db.execute('SELECT id,generation,cursor,snapshot_end,baseline_done,observed_size,error FROM sources')]
-    known = {r['id'] for r in rows}
-    missing = [s['id'] for s in cfg['sources'] if s['id'] not in known]
-    pending = db.execute('SELECT count(*) FROM outbox WHERE published=0').fetchone()[0]
-    ready = bool(rows) and not missing and all(r['baseline_done'] and not r['error'] for r in rows)
-    return {'sources': rows, 'uninitialized_sources': missing, 'snapshot_scan_done': ready,
-            'pending_chunks': pending, 'backfill_published': ready and pending == 0}
-
-
-def chunk_path(root, cfg, cid):
-    folder = inside(root, Path(root) / 'share' / 'telemetry' / cfg['publisher_id'])
-    legacy = inside(root, folder / (cid + '.jsonl'))
-    compressed = inside(root, folder / (cid + '.jsonl.gz'))
-    if legacy.exists() and compressed.exists():
-        raise ValueError('A chunk has conflicting plain and compressed delivery paths')
-    return legacy if legacy.exists() else compressed
-
-
-def delivery_bytes(dest, raw):
-    return gzip.compress(raw, compresslevel=6, mtime=0) if dest.name.endswith('.gz') else raw
-
-
-def export_batch(root, cfg, db, max_bytes=1024*1024):
-    used, plan = 0, []
-    for row in db.execute('SELECT * FROM outbox WHERE published=0 ORDER BY rowid'):
-        if plan and used + len(row['data']) > max_bytes:
-            break
-        if sha(row['data']) != row['sha256']:
-            raise ValueError('Outbox checksum mismatch')
-        dest = chunk_path(root, cfg, row['id'])
-        data = delivery_bytes(dest, row['data'])
-        if dest.exists():
-            if dest.read_bytes() != data:
-                raise ValueError('Published chunk filename has conflicting content')
-        plan.append((row, dest))
-        used += len(row['data'])
-    from transport import check_sizes
-    files = [dest for row, dest in plan if dest.exists()]
-    if check_sizes(files):
-        raise ValueError('share file size check failed; pending chunks retained locally')
-    for row, dest in plan:
-        if not dest.exists():
-            atomic(dest, delivery_bytes(dest, row['data']))
-    ids = [row['id'] for row, _ in plan]
-    with db:
-        db.executemany('UPDATE outbox SET exported=1 WHERE id=?', [(cid,) for cid in ids])
-    return ids
-
-
-def acknowledge(db, ids):
-    with db:
-        db.executemany('UPDATE outbox SET published=1 WHERE id=?', [(cid,) for cid in ids])
+    missing = [s['id'] for s in cfg['sources'] if s['id'] not in {r['id'] for r in rows}]
+    version = db.execute('PRAGMA user_version').fetchone()[0]
+    pending = db.execute('SELECT count(*) FROM ' + ('local_files' if version == 2 else 'outbox WHERE published=0')).fetchone()[0]
+    return dict(sources=rows, uninitialized_sources=missing, state_version=version,
+                migration_required=version==1, local_pending_chunks=pending,
+                snapshot_scan_done=bool(rows) and not missing and all(s['baseline_done'] and not s['error'] for s in rows))

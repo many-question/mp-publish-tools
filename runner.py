@@ -47,37 +47,14 @@ def bind(root, args):
     return 0
 
 
-def pending_before_new_export():
-    upstream = transport.git('rev-parse', '--verify', '@{upstream}', check=False)
-    if upstream.returncode:
-        return bool(transport.git('rev-parse', '--verify', 'HEAD', check=False).returncode == 0)
-    return bool(transport.git('rev-list', '@{upstream}..HEAD').stdout.strip())
-
-
-def flush(root, cfg, db, message, telemetry_only=False):
-    # Retry an already committed batch before exporting another one. Git is not a
-    # byte-resumable protocol; bounded application batches keep retries bounded.
-    if pending_before_new_export():
-        # Do not stage newly accumulated files into the pending retry commit.
-        branch = transport.git('rev-parse', '--abbrev-ref', 'HEAD').stdout.strip()
-        for problem in transport.check_key():
-            print(problem, file=sys.stderr)
-            return 1
-        if transport.git('push', '-u', 'origin', branch, check=False).returncode:
-            print('先前提交仍未推送成功，保留待发送数据。', file=sys.stderr)
-            return 1
-    ids = collector.export_batch(root, cfg, db)
-    result = transport.publish(message, telemetry_only=telemetry_only)
-    if result == 0:
-        for cid in ids:
-            dest = collector.chunk_path(root, cfg, cid)
-            rel = dest.relative_to(root / 'share').as_posix()
-            actual = transport.git('show', 'HEAD:' + rel, check=False, binary=True)
-            expected = db.execute('SELECT data FROM outbox WHERE id=?', (cid,)).fetchone()[0]
-            if actual.returncode or actual.stdout != collector.delivery_bytes(dest, expected):
-                raise ValueError('A telemetry chunk was not committed verbatim (check share ignores/filters)')
-        collector.acknowledge(db, ids)
-    return result
+def current_status(db, cfg):
+    current = collector.status(db, cfg)
+    current.update(transport.sync_status())
+    current['pending_chunks'] += current['local_pending_chunks']
+    current['backfill_published'] = current['snapshot_scan_done'] and not current['pending_chunks'] and current['remote_contains_head']
+    current['runtime_version'] = json.loads((Path(__file__).parent / 'release.json').read_text(encoding='utf-8'))['version']
+    current['runtime_release_sha256'] = collector.PUBLISHER_RELEASE
+    return current
 
 
 def main():
@@ -102,13 +79,17 @@ def main():
     ap.add_argument('--update-ref', default='refs/heads/stable')
     ap.add_argument('--share-limit-mb', type=int, help=argparse.SUPPRESS)  # old callers; ignored
     ap.add_argument('--max-seconds', type=float, default=0, help='回填总时间预算；0 表示持续至本次快照结束')
-    ap.add_argument('--batch-bytes', type=int, default=4*1024*1024, help='单批原始读取预算；完整大记录可跨预算')
+    ap.add_argument('--batch-bytes', type=int, default=4*1024*1024, help=argparse.SUPPRESS)
+    ap.add_argument('--chunk-mb', type=float, default=2, help='压缩后分块水位，0.0625 至 4 MiB')
+    ap.add_argument('--checkpoint-seconds', type=float, default=60, help='本地扫描检查点间隔')
     ap.add_argument('-m', '--message', default='')
     args = ap.parse_args(sys.argv[2:])
     if args.restart_backfill and not args.backfill:
         ap.error('--restart-backfill requires --backfill')
     if args.batch_bytes < 1 or args.max_seconds < 0:
         raise ValueError('Budgets must be positive (max-seconds may be zero)')
+    if not 0.0625 <= args.chunk_mb <= 4 or args.checkpoint_seconds <= 0:
+        raise ValueError('Invalid compressed watermark or checkpoint interval')
     transport.configure(root)
     if args.init or args.add_source:
         return bind(root, args)
@@ -125,7 +106,7 @@ def main():
     if not statefile.exists() and not args.backfill:
         print('尚未首次回填，普通调用不会扫描历史。请操作者运行 --backfill。')
         return 2 if args.status else transport.publish(args.message)
-    db = collector.connect(root)
+    db = collector.connect(root, cfg, read_only=args.status)
     try:
         if args.backfill:
             collector.initialize(root, cfg, db)
@@ -138,10 +119,7 @@ def main():
         if args.restart_backfill:
             collector.restart_backfill(root, cfg, db)
         if args.status:
-            current = collector.status(db, cfg)
-            current['runtime_version'] = json.loads((Path(__file__).parent / 'release.json').read_text(encoding='utf-8'))['version']
-            current['runtime_release_sha256'] = collector.PUBLISHER_RELEASE
-            print(json.dumps(current, ensure_ascii=False, indent=2))
+            print(json.dumps(current_status(db, cfg), ensure_ascii=False, indent=2))
             return 0
         before = collector.status(db, cfg)
         bootstrapped = db.execute("SELECT value FROM meta WHERE key='bootstrapped'").fetchone()
@@ -149,40 +127,23 @@ def main():
         if not args.backfill and (not bootstrapped or not source_ready):
             print('首次回填/来源重建尚未完成；请操作者继续 --backfill。')
             return transport.publish(args.message)
-        deadline = time.monotonic() + args.max_seconds if args.max_seconds else float('inf')
-        while True:
-            if args.backfill and time.monotonic() >= deadline:
-                print('回填预算结束；再次执行 --backfill 从断点继续。')
-                return 3
-            # Backlog from a failed push is sent before collecting additional bytes.
-            if db.execute('SELECT count(*) FROM outbox WHERE published=0').fetchone()[0] == 0:
-                collector.collect(root, cfg, db, args.backfill, seconds=3, byte_budget=args.batch_bytes)
-            try:
-                result = flush(root, cfg, db, args.message or ('session backfill' if args.backfill else 'share update'), telemetry_only=args.backfill)
-            except ValueError as exc:
-                if args.backfill:
-                    raise
-                print('遥测待发送数据已保留：' + str(exc), file=sys.stderr)
-                return transport.publish(args.message)
-            if result:
-                return result
-            current = collector.status(db, cfg)
-            atomic(inside(root, local_state(root) / 'status.json'), encode(current))
-            if not args.backfill:
-                for src in current['sources']:
-                    if src['error']:
-                        print('遥测待处理：' + src['id'] + ' ' + src['error'], file=sys.stderr)
-                return 0
-            print('回填：已处理字节 ' + str(sum(s['cursor'] for s in current['sources'])) +
-                  '；待发分块 ' + str(current['pending_chunks']), flush=True)
-            if current['backfill_published']:
-                with db:
-                    db.execute("INSERT OR REPLACE INTO meta VALUES ('bootstrapped','1')")
-                print('首次快照的完整记录已回填并推送；后续普通 publish 只处理新增记录。')
-                return 0
-            if any(src['error'] for src in current['sources']):
-                print(json.dumps(current, ensure_ascii=False, indent=2))
-                return 2
+        stats = collector.collect(root, cfg, db, args.backfill, seconds=args.max_seconds,
+                                  chunk_bytes=int(args.chunk_mb*1024*1024),
+                                  checkpoint_seconds=args.checkpoint_seconds)
+        print(json.dumps({'collection': stats}, ensure_ascii=False), flush=True)
+        if stats['budget_exhausted']:
+            print('扫描预算结束，数据和游标已在本地保存；再次运行继续，扫描完成后统一推送。')
+            return 3
+        started = time.monotonic()
+        result = transport.publish(args.message or ('session backfill' if args.backfill else 'share update'),
+                                   telemetry_only=args.backfill)
+        current = current_status(db, cfg)
+        current['publish_seconds'] = time.monotonic()-started
+        atomic(inside(root, local_state(root) / 'status.json'), encode(current))
+        print(json.dumps(current, ensure_ascii=False, indent=2))
+        if result:
+            return result
+        return 2 if any(s['error'] for s in current['sources']) else 0
     finally:
         db.close()
 
