@@ -138,7 +138,10 @@ def main():
         if args.restart_backfill:
             collector.restart_backfill(root, cfg, db)
         if args.status:
-            print(json.dumps(collector.status(db, cfg), ensure_ascii=False, indent=2))
+            current = collector.status(db, cfg)
+            current['runtime_version'] = json.loads((Path(__file__).parent / 'release.json').read_text(encoding='utf-8'))['version']
+            current['runtime_release_sha256'] = collector.PUBLISHER_RELEASE
+            print(json.dumps(current, ensure_ascii=False, indent=2))
             return 0
         before = collector.status(db, cfg)
         bootstrapped = db.execute("SELECT value FROM meta WHERE key='bootstrapped'").fetchone()

@@ -1,11 +1,11 @@
 {
   "schema": "mp-publish-release/1",
-  "version": "1.0.5",
+  "version": "1.0.6",
   "launcher_api": 1,
   "state_version": 1,
   "projection_version": "skeleton-1",
   "files": {
-    "runner.py": "daa555ac12e063574326d31734fe3aa730eb36dee12e6d84f70a2f46938f7039",
+    "runner.py": "3310a5756ae727eaafc4a95437be507dc7ba7c4f0c21243502b08f558e27738d",
     "common.py": "c3bd0df41f1db54c5b6fc440691cca3bba6226a1c7e92fd7b8f3c05e572dbbe9",
     "collector.py": "0c0570a30a78352fdab68c2ed79794f8362e737a96659d01ab23c2c633d88624",
     "projection.py": "269269302e6341f0898633b1711c130f4da8920e48f406b02cce4d01e5027e22",
