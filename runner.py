@@ -14,7 +14,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from common import atomic, encode, inside, local_state, read_config
 import collector
 import transport
-from projection import project
+from projection import VERSION, project
 
 
 def bind(root, args):
@@ -54,14 +54,23 @@ def current_status(db, cfg):
     current['backfill_published'] = current['snapshot_scan_done'] and not current['pending_chunks'] and current['remote_contains_head']
     current['runtime_version'] = json.loads((Path(__file__).parent / 'release.json').read_text(encoding='utf-8'))['version']
     current['runtime_release_sha256'] = collector.PUBLISHER_RELEASE
+    # The projection rules actually loaded, not the manifest of the bin baseline.
+    current['projection_version'] = VERSION
     return current
 
 
 def main():
     if sys.argv[1:] == ['--self-test']:
         assert project({'type':'user','message':{'role':'user','content':'fixture'}})['native']['message']['content'] == 'fixture'
-        assert 'text' not in project({'role':'assistant','content':[{'type':'text','text':'private'}]})['native']['content'][0]
-        print('runtime self-test OK')
+        blocks = project({'role':'assistant','content':[
+            {'type':'text','text':'visible'},
+            {'type':'thinking','thinking':'hidden','signature':'sig'},
+            {'type':'tool_use','id':'t1','name':'Bash','input':{'command':'ls -la','description':'d'}}]})['native']['content']
+        assert blocks[0]['text'] == 'visible', 'assistant visible text must survive'
+        assert blocks[1] == {'type': 'thinking'}, 'hidden reasoning must not survive'
+        assert blocks[2]['input_head'] == 'ls -la' and 'input' not in blocks[2]
+        assert len(blocks[2]['input_sha256']) == 64 and blocks[2]['input_bytes'] > 0
+        print('runtime self-test OK (' + VERSION + ')')
         return 0
     root = Path(sys.argv[1]).resolve(strict=True)
     ap = argparse.ArgumentParser(description='每个工作区独立配置；首次 --backfill，此后普通调用只增量处理。')

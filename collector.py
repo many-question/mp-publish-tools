@@ -295,6 +295,7 @@ class Stream:
 def collect(root, cfg, db, backfill, seconds=0, byte_budget=None,
             chunk_bytes=CHUNK_BYTES, checkpoint_seconds=60):
     """Scan frozen ends continuously; checkpoints never invoke Git/network."""
+    from transport import SECRET_PATTERNS
     started = time.perf_counter()
     deadline = started + seconds if seconds else float('inf')
     materialize(root, db)
@@ -367,12 +368,13 @@ def collect(root, cfg, db, backfill, seconds=0, byte_budget=None,
                             tail = True
                             break
                         native = json.loads(raw.decode('utf-8'))
-                        event = project(native)
+                        # Assistant text and tool heads are masked in place here;
+                        # a hit in user text still blocks the record below.
+                        event = project(native, SECRET_PATTERNS)
                         event.update(schema='mp-session-event/1', run_id=cfg['run_id'],
                             publisher_id=cfg['publisher_id'], framework=cfg['framework'],
                             source_id=src['id'], generation=src['generation'],
                             byte_start=cursor, byte_end=cursor+len(raw), collected_at=time.time())
-                        from transport import SECRET_PATTERNS
                         check_text(encode(event).decode('utf-8'), SECRET_PATTERNS)
                         stream.event(event)
                         cursor += len(raw)
