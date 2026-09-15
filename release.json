@@ -1,6 +1,6 @@
 {
   "schema": "mp-publish-release/1",
-  "version": "3.0.0",
+  "version": "3.0.1",
   "launcher_api": 1,
   "state_version": 2,
   "projection_version": "skeleton-2",
@@ -9,7 +9,7 @@
     "common.py": "143181a6908b16d0746ae5da88113e3c2e4987bd5491c7ab9e3523f83db255cc",
     "collector.py": "4d3286ef4e124fe132ef5958c99fe97a8829331de84f1fcd8efcfaa5187f33fe",
     "projection.py": "5c4a0f65f0b11109ac040fb22f9afeb6fbcaa3c66eac6b875ec83a0b1bd8233b",
-    "transport.py": "c7e77b8b6cf4378512ae2ff300fa32cfb4ea5c4034aad1763aeb37604d94be5c",
+    "transport.py": "7fb46eab6fc63e86e03caf13afa3c2b8a97b67c4b26c56ff320783b75bee23b3",
     "validate_report.py": "c187a16804a562deed591c428aaccffa5e6c763029849d6f8904e744d12c10af"
   }
 }

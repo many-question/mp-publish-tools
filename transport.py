@@ -127,8 +127,12 @@ def check_secrets(files) -> list[str]:
                 if len(raw) > 64*1024*1024:
                     raise ValueError('Telemetry chunk expands beyond its block limit')
                 from projection import check_text
-                for line in raw.decode('utf-8').splitlines():
-                    check_text(line, SECRET_PATTERNS)
+                # JSONL records are delimited only by LF bytes.  str.splitlines()
+                # also treats characters such as U+2028/U+2029/NEL as line
+                # boundaries, even when they legally occur inside a JSON string.
+                for line in raw.decode('utf-8').split('\n'):
+                    if line.strip():
+                        check_text(line, SECRET_PATTERNS)
             except (OSError, ValueError, EOFError, zlib.error):
                 problems.append('压缩遥测完整性或秘密检查失败: ' + str(f.relative_to(SHARE)))
             continue
@@ -149,7 +153,7 @@ def check_secrets(files) -> list[str]:
         if f.suffix.lower() == '.jsonl':
             from projection import check_text
             try:
-                for line in text.splitlines():
+                for line in text.split('\n'):
                     if line.strip():
                         check_text(line, SECRET_PATTERNS)
             except ValueError:
