@@ -1,6 +1,6 @@
 {
   "schema": "mp-publish-release/1",
-  "version": "3.0.1",
+  "version": "3.2.0",
   "launcher_api": 1,
   "state_version": 2,
   "projection_version": "skeleton-2",
@@ -9,7 +9,115 @@
     "common.py": "143181a6908b16d0746ae5da88113e3c2e4987bd5491c7ab9e3523f83db255cc",
     "collector.py": "4d3286ef4e124fe132ef5958c99fe97a8829331de84f1fcd8efcfaa5187f33fe",
     "projection.py": "5c4a0f65f0b11109ac040fb22f9afeb6fbcaa3c66eac6b875ec83a0b1bd8233b",
-    "transport.py": "7fb46eab6fc63e86e03caf13afa3c2b8a97b67c4b26c56ff320783b75bee23b3",
-    "validate_report.py": "c187a16804a562deed591c428aaccffa5e6c763029849d6f8904e744d12c10af"
+    "transport.py": "e41b5e98b260056caf4e23bed688e5df50704efeebdf3826b77ddc76bd61d059",
+    "validate_report.py": "a01baef023390bf2a9875bb7e562d8640af8ec8c7c0c929409b2416844aa405e"
+  },
+  "profile": {
+    "levels": [
+      {
+        "key": "survey",
+        "label": "\u8c03\u7814"
+      },
+      {
+        "key": "modeling",
+        "label": "\u5efa\u6a21"
+      },
+      {
+        "key": "architecture",
+        "label": "\u67b6\u6784"
+      },
+      {
+        "key": "blocks",
+        "label": "\u6a21\u5757",
+        "list": true
+      },
+      {
+        "key": "verification",
+        "label": "\u9a8c\u8bc1"
+      },
+      {
+        "key": "integration",
+        "label": "\u96c6\u6210"
+      }
+    ],
+    "maturity": [
+      "\u672a\u5f00\u59cb",
+      "\u63a2\u7d22\u4e2d",
+      "\u6709\u521d\u7a3f",
+      "\u5df2\u81ea\u9a8c\u8bc1",
+      "\u5df2\u51bb\u7ed3"
+    ],
+    "triggers": {
+      "requested": "\u4eba\u7c7b\u8981\u6c42",
+      "proactive": "\u4e3b\u52a8\u6c47\u62a5",
+      "handoff": "\u4ea4\u63a5"
+    },
+    "confidence": {
+      "low": "\u4f4e",
+      "medium": "\u4e2d",
+      "high": "\u9ad8"
+    },
+    "stages": {
+      "concept": "\u6784\u60f3",
+      "behavioral": "\u884c\u4e3a\u7ea7",
+      "circuit": "\u7535\u8def\u7ea7",
+      "layout": "\u7248\u56fe",
+      "post_layout": "\u540e\u4eff"
+    },
+    "evidence": {
+      "none": "\u65e0\u8bc1\u636e",
+      "estimate": "\u4f30\u7b97",
+      "behavioral_sim": "\u884c\u4e3a\u4eff\u771f",
+      "circuit_sim": "\u7535\u8def\u4eff\u771f",
+      "pvt_sim": "PVT \u4eff\u771f",
+      "post_layout_sim": "\u540e\u4eff",
+      "measured": "\u5b9e\u6d4b"
+    },
+    "spec_status": {
+      "unknown": {
+        "label": "\u672a\u8bc4\u4f30",
+        "tone": "zero"
+      },
+      "on_track": {
+        "label": "\u5728\u8f68",
+        "tone": "info"
+      },
+      "at_risk": {
+        "label": "\u6709\u98ce\u9669",
+        "tone": "warn"
+      },
+      "met": {
+        "label": "\u5df2\u8fbe\u6210",
+        "tone": "ok"
+      },
+      "infeasible": {
+        "label": "\u4e0d\u53ef\u884c",
+        "tone": "bad"
+      },
+      "redefine_proposed": {
+        "label": "\u5efa\u8bae\u91cd\u5b9a\u4e49",
+        "tone": "alt"
+      }
+    },
+    "specs": {
+      "source": "02 \u6587\u6863",
+      "example": "ASP-003",
+      "condition_hint": "\u9891\u7387/\u8d1f\u8f7d/\u5e45\u5ea6/\u5de5\u827a\u89d2\u7b49",
+      "required": [
+        "ASP-001",
+        "ASP-002",
+        "ASP-003",
+        "ASP-004",
+        "ASP-005",
+        "ASP-006",
+        "ASP-007",
+        "ASP-008",
+        "ASP-009",
+        "CON-001"
+      ]
+    },
+    "limits": {
+      "max_file_mb": 5
+    }
   }
 }

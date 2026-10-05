@@ -15,6 +15,7 @@ import argparse
 import datetime
 import gzip
 import hashlib
+import json
 import zlib
 import os
 import pathlib
@@ -22,7 +23,25 @@ import re
 import subprocess
 import sys
 
-MAX_FILE_MB = 5
+
+def _limit(profile_file, name):
+    try:
+        data = json.loads(pathlib.Path(profile_file).read_text(encoding='utf-8'))
+        if 'files' in data and 'profile' in data:  # release.json
+            data = data['profile']
+        value = ((data or {}).get('limits') or {}).get(name)
+    except (OSError, ValueError, AttributeError, TypeError):
+        return None
+    return value if isinstance(value, (int, float)) and not isinstance(value, bool) and value > 0 else None
+
+
+def max_file_mb(default=5):
+    """单文件上限：工作区 .mp-publish/profile.json（接入时写入）优先，其次打包时写进 release.json 的，最后平台默认。"""
+    for source in (ROOT / '.mp-publish' / 'profile.json', pathlib.Path(__file__).resolve().parent / 'release.json'):
+        value = _limit(source, 'max_file_mb')
+        if value:
+            return value
+    return default
 
 SECRET_PATTERNS = [
     (re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----"), "私钥"),
@@ -105,13 +124,14 @@ def collect_files() -> list[pathlib.Path]:
 
 def check_sizes(files) -> list[str]:
     problems, total = [], 0
+    limit = max_file_mb()
     for f in files:
         size = f.stat().st_size
         total += size
-        if size > MAX_FILE_MB * 1024 * 1024:
+        if size > limit * 1024 * 1024:
             problems.append(
                 f"{f.relative_to(ROOT).as_posix()} 有 {size/1048576:.1f} MB，"
-                f"超过单文件上限 {MAX_FILE_MB} MB。"
+                f"超过单文件上限 {limit} MB。"
                 "大数据请留在本地，在汇报里写明路径、哈希和重新生成的方法。"
             )
     return problems
@@ -166,7 +186,7 @@ def check_reports() -> list[str]:
     try:
         from validate_report import validate_file
     except ImportError:
-        return ["跳过汇报格式校验：找不到 bin/validate_report.py"]
+        return ["跳过汇报格式校验：找不到 validate_report.py"]
     problems = []
     reports = sorted((SHARE / "reports").glob("*.yaml")) if (SHARE / "reports").is_dir() else []
     if not reports:
