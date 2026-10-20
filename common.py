@@ -61,4 +61,10 @@ def read_config(root):
     ids = [s['id'] for s in cfg['sources']]
     if len(ids) != len(set(ids)):
         raise ValueError('Duplicate source binding IDs')
+    # 3.3：可选的桌面版 session 家族（根与目录）；没有时行为不变。
+    family = cfg.get('family')
+    if family is not None and (not isinstance(family, dict) or not isinstance(family.get('roots', []), list)
+            or not all(isinstance(r, str) and re.fullmatch('local_[A-Za-z0-9-]{1,80}', r) for r in family.get('roots', []))
+            or not all(isinstance(family[k], str) for k in ('registry_dir', 'projects_dir', 'notes_dir') if k in family)):
+        raise ValueError('Invalid session family binding')
     return cfg

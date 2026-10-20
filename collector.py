@@ -11,13 +11,29 @@ import uuid
 import zlib
 
 from common import atomic, encode, inside, local_state
-from projection import VERSION, check_text, project
+from projection import (NOTE_TEXT_BYTES, NOTE_TEXT_SUFFIXES, VERSION, check_text, mask, project, project_note,
+                        project_registry, real, within)
 
 MAX_RECORD = 64 * 1024 * 1024
 MAX_EXPANDED = 64 * 1024 * 1024
 CHUNK_BYTES = 2 * 1024 * 1024  # compressed output watermark, not input bytes
 FRAGMENT_BYTES = 128 * 1024
 PUBLISHER_RELEASE = hashlib.sha256((Path(__file__).parent / 'release.json').read_bytes()).hexdigest()
+# 普通 publish 里新发现的家族日志自动回填的时间预算（没给 --max-seconds 时）；没做完的下次接着做。
+FAMILY_SECONDS = 60
+NOTE_FILES = 1000
+MISSING = 'source missing'
+# A family source that changed is collected again by the next publish; not an error that needs anyone.
+CHANGED_AGAIN = 'source changed; the next publish collects it again'
+# 3.3: sources found through the session family live in their own table. 3.2 never reads it, so a
+# fallback to a 3.2 runtime keeps collecting the operator-bound sources (state_version stays 2).
+FAMILY_TABLE = '''CREATE TABLE IF NOT EXISTS family_sources(
+  id TEXT PRIMARY KEY, path TEXT NOT NULL, generation TEXT NOT NULL,
+  identity TEXT NOT NULL, cursor INTEGER NOT NULL DEFAULT 0,
+  snapshot_end INTEGER NOT NULL, baseline_done INTEGER NOT NULL DEFAULT 0,
+  prefix_n INTEGER NOT NULL DEFAULT 0, prefix_hash TEXT, boundary_hash TEXT,
+  observed_size INTEGER NOT NULL, error TEXT)'''
+SOURCE_COLUMNS = 'id,path,generation,identity,cursor,snapshot_end,baseline_done,prefix_n,prefix_hash,boundary_hash,observed_size,error'
 
 
 def sha(data):
@@ -58,11 +74,13 @@ def connect(root, cfg=None, read_only=False):
         finally:
             saved.close()
     if version == 2:
+        db.execute(FAMILY_TABLE)
         return db
     try:
         db.execute("BEGIN IMMEDIATE")
         with db:
             db.execute('CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT NOT NULL)')
+            db.execute(FAMILY_TABLE)
             db.execute('''CREATE TABLE IF NOT EXISTS sources(
               id TEXT PRIMARY KEY, path TEXT NOT NULL, generation TEXT NOT NULL,
               identity TEXT NOT NULL, cursor INTEGER NOT NULL DEFAULT 0,
@@ -138,6 +156,12 @@ def initialize(root, cfg, db):
                 if old['path'] != src['path']:
                     raise ValueError('Source binding changed; add a new source explicitly')
                 continue
+            if db.execute('SELECT 1 FROM family_sources WHERE id=?', (src['id'],)).fetchone():
+                # The operator now binds a log the family already collects: move it with its cursor, never twice.
+                db.execute('INSERT INTO sources(' + SOURCE_COLUMNS + ') SELECT ' + SOURCE_COLUMNS + ' FROM family_sources WHERE id=?',
+                           (src['id'],))
+                db.execute('DELETE FROM family_sources WHERE id=?', (src['id'],))
+                continue
             path = source_path(root, src)
             stat = path.stat()
             generation = uuid.uuid4().hex
@@ -149,17 +173,246 @@ def initialize(root, cfg, db):
 
 def restart_backfill(root, cfg, db):
     with db:
-        for src in cfg['sources']:
-            old = db.execute('SELECT * FROM sources WHERE id=?', (src['id'],)).fetchone()
+        rows = {r['id']: dict(r, _table='sources') for r in db.execute('SELECT * FROM sources ORDER BY rowid')}
+        explicit = {s['id'] for s in cfg['sources']}
+        targets = [(rows[s['id']], s) for s in cfg['sources']]
+        # 家族发现的来源一并重采集：操作者已经绑定的不重复（否则留下孤儿代次），日志已经不在的跳过。
+        targets += [(old, old) for old in family_rows(db) if old['id'] not in explicit and os.path.exists(old['path'])]
+        for old, src in targets:
             stat = source_path(root, src).stat()
             generation = uuid.uuid4().hex
             observe(db, cfg, dict(src, generation=generation), 'operator_backfill_restart',
                     previous_generation=old['generation'], previous_cursor=old['cursor'],
                     observed_bytes=stat.st_size, snapshot_end=stat.st_size)
-            db.execute('''UPDATE sources SET generation=?,identity=?,cursor=0,snapshot_end=?,
+            db.execute('UPDATE ' + old['_table'] + ''' SET generation=?,identity=?,cursor=0,snapshot_end=?,
                 observed_size=?,baseline_done=0,prefix_n=0,prefix_hash=NULL,boundary_hash=NULL,error=NULL WHERE id=?''',
                 (generation, identity(stat), stat.st_size, stat.st_size, src['id']))
         db.execute("DELETE FROM meta WHERE key='bootstrapped'")
+
+
+def family_rows(db):
+    """家族发现的来源：family_sources 表（3.2 不读它）；还没有这张表时为空。"""
+    if not db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='family_sources'").fetchone():
+        return []
+    return [dict(r, _table='family_sources') for r in db.execute('SELECT * FROM family_sources ORDER BY rowid')]
+
+
+def family_state(db):
+    """家族采集的本地记录（meta 表的 family 键）：调用 publish 时成为根的主持、发现的来源属于哪个成员、
+    已排队上传的登记与笔记版本、被秘密检查拦下的版本、笔记文件的大小与修改时间、已记过的工作区外成员，
+    以及记过观察的问题：登记目录不在、读不了的登记、笔记超过上限。"""
+    row = db.execute("SELECT value FROM meta WHERE key='family'").fetchone()
+    state = json.loads(row[0]) if row else {}
+    for key, kind in (('roots', list), ('sources', dict), ('sent', dict), ('blocked', dict), ('seen', dict),
+                      ('outside', list), ('unavailable', bool), ('unreadable', list), ('truncated', list)):
+        if not isinstance(state.get(key), kind):
+            state[key] = kind()
+    return state
+
+
+def saved_roots(root):
+    """本地状态里记下的根，只读；还没有状态时为空。"""
+    path = inside(root, local_state(root) / 'state.sqlite')
+    if not path.exists():
+        return []
+    db = sqlite3.connect(path.as_uri() + '?mode=ro', uri=True)
+    try:
+        return family_state(db)['roots']
+    except sqlite3.Error:
+        return []
+    finally:
+        db.close()
+
+
+def shown(key, patterns):
+    """被拦下的登记或笔记在输出里的写法：笔记的文件名本身命中秘密检查时不原样打印。"""
+    if any(pattern.search(key) for pattern, _ in patterns):
+        return key.split('/', 1)[0] + '/(file name matched the secret check)'
+    return key
+
+
+def note_files(folder, root):
+    """笔记目录里的普通文件（含子目录）：([(相对路径, 路径)], 超过上限, 读目录出错)。
+    不跟随链接与目录联接，解析之后要在笔记根目录 root 里面。"""
+    if not folder.exists():
+        return [], False, False
+    if not folder.is_dir() or not within(folder, root):
+        return [], False, True
+    out, errors = [], []
+    for base, dirs, files in os.walk(folder, onerror=errors.append):
+        dirs[:] = sorted(d for d in dirs if within(Path(base) / d, root))
+        for name in sorted(files):
+            path = Path(base) / name
+            if not within(path, root) or not path.is_file():
+                continue
+            if len(out) >= NOTE_FILES:
+                return out, True, bool(errors)
+            out.append((path.relative_to(folder).as_posix(), path))
+    return out, False, bool(errors)
+
+
+def read_note(path, size):
+    """(文件 sha256, 文本文件不超过 1 MiB 时的全部字节)。"""
+    digest, parts = hashlib.sha256(), []
+    keep = size <= NOTE_TEXT_BYTES and path.name.lower().endswith(NOTE_TEXT_SUFFIXES)
+    with path.open('rb') as fh:
+        while chunk := fh.read(1024 * 1024):
+            digest.update(chunk)
+            if keep:
+                parts.append(chunk)
+    return digest.hexdigest(), b''.join(parts) if keep else None
+
+
+def discover(root, cfg, db, desktop):
+    """家族发现（docs/multi-session.md 4.1–4.4），在一个事务里：新成员的日志登记为来源（随后在预算内
+    自动回填），登记与共享笔记有新版本就排进待发送队列。只收工作区里的成员；工作区外的只记一条观察。
+
+    秘密检查：登记里的文字就地遮盖、照常发送；笔记正文命中只发清单。遮盖之后仍有命中（例如笔记的
+    文件名）的那一条才留在本地，列进 blocked。意外的错误不挡住交付：记一条观察，这一次跳过家族发现。"""
+    try:
+        return _discover(root, cfg, db, desktop)
+    except sqlite3.Error:
+        raise
+    except Exception as exc:  # 文件刚被删、没有权限、结构太深……
+        with db:
+            db.execute('INSERT INTO observations(data) VALUES (?)', (encode(dict(
+                schema='mp-source-observation/1', run_id=cfg['run_id'], publisher_id=cfg['publisher_id'],
+                source_id='registry:', generation=None, observation='family_discovery_failed',
+                error_type=type(exc).__name__, collected_at=time.time(), projection_version=VERSION)),))
+        return dict(error=type(exc).__name__)
+
+
+def _discover(root, cfg, db, desktop):
+    from transport import SECRET_PATTERNS
+    state = family_state(db)
+    roots = [(r, 'bound_root') for r in desktop.bound]
+    roots += [(r, 'caller_root') for r in state['roots'] if r not in desktop.bound]
+    role, caller = desktop.classify({r for r, _ in roots})
+    if role == 'new_root':
+        roots.append((caller, 'caller_root'))
+        state['roots'].append(caller)
+    rows = db.execute('SELECT id, path FROM sources').fetchall() + [dict(id=r['id'], path=r['path']) for r in family_rows(db)]
+    ids = {r['id'] for r in rows} | {s['id'] for s in cfg['sources']}
+    known = {os.path.normcase(p) for p in [r['path'] for r in rows] + [s['path'] for s in cfg['sources']]}
+    old_blocked, blocked, now = state['blocked'], {}, time.time()
+    envelope = dict(run_id=cfg['run_id'], publisher_id=cfg['publisher_id'], framework='claude-desktop', observed_at=now)
+    summary = dict(roots=[r for r, _ in roots], members=0, outside=0, new_sources=0, records=0, masked=0)
+
+    def notice(source_id, kind, **extra):
+        db.execute('INSERT INTO observations(data) VALUES (?)', (encode(dict(
+            schema='mp-source-observation/1', run_id=cfg['run_id'], publisher_id=cfg['publisher_id'],
+            source_id=source_id, generation=None, observation=kind, collected_at=now, projection_version=VERSION, **extra)),))
+
+    def queue(key, digest, event):
+        raw = encode(event)
+        try:
+            check_text(raw.decode('utf-8'), SECRET_PATTERNS)
+        except ValueError:
+            # 遮盖之后还有命中：这一条留在本地，内容变了再试。
+            blocked[key] = digest
+            return
+        db.execute('INSERT INTO observations(data) VALUES (?)', (raw,))
+        state['sent'][key] = digest
+        summary['records'] += 1
+
+    with db:
+        if roots:
+            # 约定第 3 节：遇到不认识的结构要计数并报告，不能静默当成没有。
+            if not desktop.registry_ok and not state['unavailable']:
+                notice('registry:', 'registry_unavailable')
+            state['unavailable'] = not desktop.registry_ok
+            unreadable = sorted(desktop.unreadable)
+            if unreadable and unreadable != state['unreadable']:
+                notice('registry:', 'registry_unreadable', count=len(unreadable))
+            state['unreadable'] = unreadable
+        for lid, relation, parent in desktop.members(roots):
+            if lid not in desktop.entries:
+                continue
+            if not desktop.inside(lid):
+                summary['outside'] += 1
+                if lid not in state['outside']:
+                    state['outside'].append(lid)
+                    notice('registry:' + lid, 'family_member_outside_workspace', desktop_session=lid, relation=relation,
+                           parent_session=parent, reason='cwd_outside_workspace')
+                continue
+            if lid in state['outside']:
+                state['outside'].remove(lid)
+            summary['members'] += 1
+            for kind, cid, path in desktop.logs(lid, [desktop.caller_cli] if lid == caller and desktop.caller_cli else []):
+                try:
+                    path = source_path(root, {'path': str(path)})
+                except (OSError, ValueError):
+                    continue
+                # 家族的日志必须在 Claude Code 的日志根目录里（不跟随指到外面的链接与目录联接）。
+                if not real(path).is_relative_to(desktop.projects_root):
+                    continue
+                sid = hashlib.sha256(str(path).encode()).hexdigest()[:24]
+                if sid in ids or os.path.normcase(str(path)) in known:
+                    continue
+                stat = path.stat()
+                generation = uuid.uuid4().hex
+                db.execute('INSERT INTO family_sources(id,path,generation,identity,snapshot_end,observed_size) VALUES (?,?,?,?,?,?)',
+                           (sid, str(path), generation, identity(stat), stat.st_size, stat.st_size))
+                observe(db, cfg, dict(id=sid, generation=generation), 'family_source_discovered',
+                        source_name=path.name, observed_bytes=stat.st_size, snapshot_end=stat.st_size,
+                        desktop_session=lid, relation=relation, parent_session=parent, log_kind=kind, cli_session_id=cid)
+                ids.add(sid)
+                known.add(os.path.normcase(str(path)))
+                state['sources'][sid] = lid
+                summary['new_sources'] += 1
+            registry, unrecognized = project_registry(desktop.entries[lid])
+            redaction = []
+            # 关系字段不能因为一段文字整条丢掉：命中的文字像 assistant 正文那样就地遮盖。
+            registry = mask(registry, SECRET_PATTERNS, '/registry', redaction)
+            key, digest = 'registry:' + lid, sha(encode(registry))
+            if state['sent'].get(key) != digest:
+                event = dict(schema='mp-session-registry/1', source_id=key, content_sha256=digest, registry=registry, **envelope)
+                if unrecognized:
+                    event['unrecognized'] = unrecognized
+                if redaction:
+                    event['redaction'] = redaction
+                    summary['masked'] += 1
+                queue(key, digest, event)
+        for lid, _ in roots:
+            prefix = 'notes:' + lid + '/'
+            present = set()
+            files, truncated, unreadable = note_files(desktop.notes_folder(lid), desktop.notes_root)
+            if truncated and lid not in state['truncated']:
+                notice('notes:' + lid, 'notes_truncated', limit=NOTE_FILES)
+            state['truncated'] = [r for r in state['truncated'] if r != lid] + ([lid] if truncated else [])
+            for name, path in files:
+                key = prefix + name
+                present.add(key)
+                try:
+                    stat = path.stat()
+                    mark = [stat.st_size, stat.st_mtime_ns]
+                    if state['seen'].get(key) == mark:
+                        if key in old_blocked:
+                            blocked[key] = old_blocked[key]
+                        continue
+                    file_digest, data = read_note(path, stat.st_size)
+                except OSError:
+                    continue
+                note = project_note(name, stat.st_size, stat.st_mtime, file_digest, data, SECRET_PATTERNS)
+                digest = sha(encode(note))
+                state['seen'][key] = mark
+                if state['sent'].get(key) != digest:
+                    queue(key, digest, dict(schema='mp-shared-note/1', source_id='notes:' + lid, content_sha256=digest,
+                                            note=note, **envelope))
+            if truncated or unreadable:
+                # 没看全目录时不做删除比对，免得误发 deleted。
+                blocked.update({k: v for k, v in old_blocked.items() if k.startswith(prefix) and k not in present})
+                continue
+            for key in [k for k in state['seen'] if k.startswith(prefix) and k not in present]:
+                del state['seen'][key]
+                note = {'name': key[len(prefix):], 'deleted': True}
+                if key in state['sent']:
+                    queue(key, sha(encode(note)), dict(schema='mp-shared-note/1', source_id='notes:' + lid,
+                                                       content_sha256=sha(encode(note)), note=note, **envelope))
+        state['blocked'] = blocked
+        db.execute("INSERT OR REPLACE INTO meta VALUES ('family',?)", (json.dumps(state, sort_keys=True),))
+    summary['blocked'] = sorted(shown(key, SECRET_PATTERNS) for key in blocked)
+    return summary
 
 
 def fingerprints(fh, cursor, prefix_n=None):
@@ -270,7 +523,7 @@ class Stream:
                 self.db.execute('INSERT INTO local_files VALUES (?,?,?)', (name, raw, sha(raw)))
             if self.dirty:
                 for src in self.states.values():
-                    self.db.execute('UPDATE sources SET generation=?,identity=?,cursor=?,snapshot_end=?,baseline_done=?,prefix_n=?,prefix_hash=?,boundary_hash=?,observed_size=?,error=? WHERE id=?',
+                    self.db.execute('UPDATE ' + src.get('_table', 'sources') + ' SET generation=?,identity=?,cursor=?,snapshot_end=?,baseline_done=?,prefix_n=?,prefix_hash=?,boundary_hash=?,observed_size=?,error=? WHERE id=?',
                         tuple(src[k] for k in ('generation','identity','cursor','snapshot_end','baseline_done',
                                               'prefix_n','prefix_hash','boundary_hash','observed_size','error','id')))
             self.db.executemany('DELETE FROM observations WHERE id=?', [(n,) for n in self.observation_ids])
@@ -293,42 +546,68 @@ class Stream:
 
 
 def collect(root, cfg, db, backfill, seconds=0, byte_budget=None,
-            chunk_bytes=CHUNK_BYTES, checkpoint_seconds=60):
-    """Scan frozen ends continuously; checkpoints never invoke Git/network."""
+            chunk_bytes=CHUNK_BYTES, checkpoint_seconds=60, family_seconds=FAMILY_SECONDS):
+    """Scan frozen ends continuously; checkpoints never invoke Git/network.
+
+    Sources found through the session family (not in cfg) need no operator: an
+    ordinary call snapshot-scans new ones within its own budget, after all increments.
+    """
     from transport import SECRET_PATTERNS
     started = time.perf_counter()
     deadline = started + seconds if seconds else float('inf')
     materialize(root, db)
-    states = {s['id']: dict(s) for s in db.execute('SELECT * FROM sources')}
+    explicit = [s['id'] for s in cfg['sources']]
+    # Rows of `sources` that are not bound any more stay ignored, as in 3.2.
+    states = {s['id']: dict(s, _table='sources') for s in db.execute('SELECT * FROM sources ORDER BY rowid') if s['id'] in explicit}
+    if any(sid not in states for sid in explicit):
+        raise ValueError('New source requires --backfill')
+    for row in family_rows(db):
+        states.setdefault(row['id'], row)
+    found = [sid for sid in states if sid not in explicit]
     ends = {}
-    for bound in cfg['sources']:
-        src = states.get(bound['id'])
-        if src is None:
-            raise ValueError('New source requires --backfill')
+    for sid in explicit + found:
         # Fix all incremental ends at invocation, not after another source finishes.
         try:
-            ends[src['id']] = source_path(root, bound).stat().st_size
+            ends[sid] = source_path(root, states[sid]).stat().st_size
         except OSError:
-            ends[src['id']] = None
+            ends[sid] = None
+    if backfill:
+        plan = [(sid, deadline) for sid in explicit + found if not states[sid]['baseline_done']]
+    else:
+        plan = [(sid, deadline) for sid in explicit + found if states[sid]['baseline_done']]
+        auto = min(deadline, started + (seconds or family_seconds))
+        plan += [(sid, auto) for sid in found if not states[sid]['baseline_done']]
     stream = Stream(root, cfg, db, states, chunk_bytes, checkpoint_seconds)
     read_bytes = 0
-    budget_end = False
+    budget_end = family_end = False
     try:
         for row in db.execute('SELECT * FROM observations ORDER BY id').fetchall():
             stream.event(json.loads(row['data']))
             stream.observation_ids.append(row['id'])
             stream.maybe_checkpoint()
-        for bound in cfg['sources']:
-            src = states[bound['id']]
-            if backfill and src['baseline_done']:
+        for sid, limit in plan:
+            src = states[sid]
+            snapshot = not src['baseline_done']
+            automatic = snapshot and not backfill
+            if sid in found and not os.path.exists(src['path']):
+                # A family log removed later (e.g. framework cleanup): recorded once, never an error.
+                if src['error'] != MISSING:
+                    src['error'] = MISSING
+                    stream.dirty = True
+                    stream.event(dict(schema='mp-source-observation/1', run_id=cfg['run_id'],
+                        publisher_id=cfg['publisher_id'], source_id=src['id'], generation=src['generation'],
+                        observation='source_missing', committed_cursor=src['cursor'],
+                        collected_at=time.time(), projection_version=VERSION))
                 continue
-            if not backfill and not src['baseline_done']:
-                continue
-            if time.perf_counter() >= deadline:
-                budget_end = True
+            if time.perf_counter() >= limit:
+                if automatic:
+                    family_end = True
+                else:
+                    budget_end = True
                 break
+            stopped = False
             try:
-                path = source_path(root, bound)
+                path = source_path(root, src)
                 stat = path.stat()
                 with path.open('rb') as fh:
                     changed = identity(stat) != src['identity'] or stat.st_size < src['observed_size']
@@ -340,7 +619,7 @@ def collect(root, cfg, db, backfill, seconds=0, byte_budget=None,
                         src.update(generation=uuid.uuid4().hex, identity=identity(stat), cursor=0,
                                    snapshot_end=stat.st_size, observed_size=stat.st_size, baseline_done=0,
                                    prefix_n=0, prefix_hash=None, boundary_hash=None,
-                                   error='source changed; operator backfill required')
+                                   error='source changed; operator backfill required' if sid in explicit else CHANGED_AGAIN)
                         stream.event(dict(schema='mp-source-observation/1', run_id=cfg['run_id'],
                             publisher_id=cfg['publisher_id'], source_id=src['id'], generation=src['generation'],
                             previous_generation=previous, observation='file_identity_or_boundary_changed',
@@ -349,7 +628,7 @@ def collect(root, cfg, db, backfill, seconds=0, byte_budget=None,
                         continue
                     if ends[src['id']] is None:
                         raise ValueError('Source was unavailable at scan start; retry required')
-                    end = min(stat.st_size, src['snapshot_end']) if backfill else min(stat.st_size, ends[src['id']])
+                    end = min(stat.st_size, src['snapshot_end']) if snapshot else min(stat.st_size, ends[src['id']])
                     start_cursor = cursor = src['cursor']
                     fh.seek(0)
                     initial_prefix = fh.read(256)
@@ -358,8 +637,8 @@ def collect(root, cfg, db, backfill, seconds=0, byte_budget=None,
                     fh.seek(cursor)
                     tail = False
                     while cursor < end:
-                        if time.perf_counter() >= deadline:
-                            budget_end = True
+                        if time.perf_counter() >= limit:
+                            stopped = True
                             break
                         raw = fh.readline(min(MAX_RECORD+1, end-cursor))
                         if len(raw) > MAX_RECORD:
@@ -393,17 +672,21 @@ def collect(root, cfg, db, backfill, seconds=0, byte_budget=None,
                     done = cursor >= end or tail
                     src['observed_size'] = after.st_size
                     src['error'] = None
-                    if backfill and done:
+                    if snapshot and done:
                         src['baseline_done'] = 1
                     stream.dirty = True
-                    if backfill and done or not backfill and cursor != start_cursor:
+                    if snapshot and done or not snapshot and cursor != start_cursor:
                         stream.event(dict(schema='mp-source-observation/1', run_id=cfg['run_id'],
                             publisher_id=cfg['publisher_id'], source_id=src['id'], generation=src['generation'],
-                            observation='snapshot_scan_finished' if backfill else 'incremental_scan',
+                            observation='snapshot_scan_finished' if snapshot else 'incremental_scan',
                             snapshot_end=src['snapshot_end'], complete_record_end=cursor,
                             unframed_tail_bytes=end-cursor if tail else 0,
                             collected_at=time.time(), projection_version=VERSION))
-                    if budget_end:
+                    if stopped:
+                        if automatic:
+                            family_end = True
+                        else:
+                            budget_end = True
                         break
             except (OSError, ValueError, RecursionError) as exc:
                 error = 'invalid JSON record' if isinstance(exc, json.JSONDecodeError) else str(exc)
@@ -416,20 +699,38 @@ def collect(root, cfg, db, backfill, seconds=0, byte_budget=None,
         stream.checkpoint()
     finally:
         stream.close()
-    ready = bool(states) and all(s['baseline_done'] and not s['error'] for s in states.values())
+    # The operator's first backfill covers the explicitly bound sources; family ones follow by themselves.
+    ready = bool(explicit) and all(states[sid]['baseline_done'] and not states[sid]['error'] for sid in explicit)
     if ready:
         with db:
             db.execute("INSERT OR REPLACE INTO meta VALUES ('bootstrapped','1')")
     return dict(raw_bytes=read_bytes, chunks=stream.files, compressed_bytes=stream.compressed,
                 expanded_bytes=stream.expanded_total, scan_seconds=time.perf_counter()-started,
-                budget_exhausted=budget_end)
+                budget_exhausted=budget_end, family_budget_exhausted=family_end,
+                family_pending=sum(1 for sid in found if not states[sid]['baseline_done'] and states[sid]['error'] != MISSING))
 
 
-def status(db, cfg):
-    rows = [dict(r) for r in db.execute('SELECT id,generation,cursor,snapshot_end,baseline_done,observed_size,error FROM sources')]
-    missing = [s['id'] for s in cfg['sources'] if s['id'] not in {r['id'] for r in rows}]
+def status(db, cfg, detail=False):
+    """sources 和 3.2 一样列出 sources 表；家族发现的来源（family_sources 表）汇总在 family 里，detail 时列出路径。
+    能自己好的情况（日志被删、换了文件等下次 publish 重收）不算 errors；被删的不再等它扫完。"""
+    from transport import SECRET_PATTERNS
+    rows = [dict(r) for r in db.execute('SELECT id,path,generation,cursor,snapshot_end,baseline_done,observed_size,error FROM sources ORDER BY rowid')]
+    explicit = [s['id'] for s in cfg['sources']]
+    found = [r for r in family_rows(db) if r['id'] not in explicit]
+    missing = [sid for sid in explicit if sid not in {r['id'] for r in rows}]
     version = db.execute('PRAGMA user_version').fetchone()[0]
     pending = db.execute('SELECT count(*) FROM ' + ('local_files' if version == 2 else 'outbox WHERE published=0')).fetchone()[0]
-    return dict(sources=rows, uninitialized_sources=missing, state_version=version,
-                migration_required=version==1, local_pending_chunks=pending,
-                snapshot_scan_done=bool(rows) and not missing and all(s['baseline_done'] and not s['error'] for s in rows))
+    state = family_state(db)
+    family = dict(roots=list(dict.fromkeys([*((cfg.get('family') or {}).get('roots') or []), *state['roots']])),
+                  sources=len(found), pending=sum(1 for r in found if not r['baseline_done'] and r['error'] != MISSING),
+                  missing=sum(1 for r in found if r['error'] == MISSING),
+                  errors=[dict(id=r['id'], path=r['path'], error=r['error']) for r in found if r['error'] not in (None, MISSING, CHANGED_AGAIN)],
+                  blocked=sorted(shown(key, SECRET_PATTERNS) for key in state['blocked']),
+                  registry=dict(available=not state['unavailable'], unreadable=len(state['unreadable'])))
+    if detail:
+        family['collected'] = [r['path'] for r in found if r['error'] != MISSING]
+    settled = all(r['baseline_done'] and not r['error'] for r in rows) and \
+        all(r['error'] == MISSING or r['baseline_done'] and not r['error'] for r in found)
+    return dict(sources=[{k: v for k, v in r.items() if k != 'path'} for r in rows], uninitialized_sources=missing,
+                state_version=version, migration_required=version==1, local_pending_chunks=pending,
+                snapshot_scan_done=bool(rows) and not missing and settled, family=family)

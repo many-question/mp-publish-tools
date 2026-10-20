@@ -1,14 +1,14 @@
 {
   "schema": "mp-publish-release/1",
-  "version": "3.2.0",
+  "version": "3.3.0",
   "launcher_api": 1,
   "state_version": 2,
-  "projection_version": "skeleton-2",
+  "projection_version": "skeleton-3",
   "files": {
-    "runner.py": "6b23ef2801b827ca28ef2de89053f708ea069eed4fa4488c99001beafba8962d",
-    "common.py": "143181a6908b16d0746ae5da88113e3c2e4987bd5491c7ab9e3523f83db255cc",
-    "collector.py": "4d3286ef4e124fe132ef5958c99fe97a8829331de84f1fcd8efcfaa5187f33fe",
-    "projection.py": "5c4a0f65f0b11109ac040fb22f9afeb6fbcaa3c66eac6b875ec83a0b1bd8233b",
+    "runner.py": "e6f6578fa0717da71c7acdd6072770f8cab4d43ec37e902a243041a073a6e1dc",
+    "common.py": "7fb8f03c154a801b2c9d79bafaef0173942f4579f53935272f7481c65042c8a6",
+    "collector.py": "26e1e5292ebe51a792ee4f0299a1fdce1d59afc38fcef19bbef123474de0b9dd",
+    "projection.py": "ed34fbe3d76cd1ad1b93d27cde0e02eaccc0a845cc28d7d190069dfb88a7f82a",
     "transport.py": "e41b5e98b260056caf4e23bed688e5df50704efeebdf3826b77ddc76bd61d059",
     "validate_report.py": "a01baef023390bf2a9875bb7e562d8640af8ec8c7c0c929409b2416844aa405e"
   },
