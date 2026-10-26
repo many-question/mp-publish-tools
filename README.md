@@ -11,6 +11,8 @@ Only the host session publishes formal reports; execution sessions hand their re
 Launchers installed before 3.3.0 accept only skeleton-1/2 and keep using their previous runtime (they print a
 notice that the tool update failed); reinstall the launcher with `arp publish-package install --workspace <ws>`
 to switch. See docs/publish/v3.3-multi-session.md in the build source.
+Version 3.3.1 also finds the desktop session registry and shared notes in the newer Windows data folder
+(%LOCALAPPDATA%\Claude-Data\<profile>\) as well as the older %APPDATA%\Claude.
 Build source: many-question/agent-research-platform, `python arp.py --project <mega-precision> publish-package build`.
 
 This repository contains tool code only. Keep agent config, transcripts, credentials and databases in their own workspaces.

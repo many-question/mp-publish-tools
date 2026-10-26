@@ -373,15 +373,30 @@ ENV_SESSION, ENV_HOST = 'CLAUDE_CODE_SESSION_ID', 'CLAUDE_CODE_HOST_SESSION_ID'
 ENV_ACCOUNT, ENV_ORG = 'CLAUDE_CODE_ACCOUNT_UUID', 'CLAUDE_CODE_ORGANIZATION_UUID'
 
 
-def desktop_home(env):
-    """桌面版的数据目录（Windows %APPDATA%\\Claude）。"""
+def desktop_homes(env):
+    """桌面版可能的数据目录，新的在前。
+
+    较新的 Windows 桌面版放在 %LOCALAPPDATA%\\Claude-Data\\<配置名>\\（2026-10 实测），较早的放在 %APPDATA%\\Claude；
+    两处都找。macOS 是 ~/Library/Application Support/Claude，Linux 是 $XDG_CONFIG_HOME/Claude。最后一个总是老位置。"""
+    homes = []
     if os.name == 'nt':
+        local = Path(env.get('LOCALAPPDATA') or Path.home() / 'AppData' / 'Local') / 'Claude-Data'
+        try:
+            homes += sorted(d for d in local.iterdir() if d.is_dir())
+        except OSError:
+            pass
         base = env.get('APPDATA') or Path.home() / 'AppData' / 'Roaming'
     elif sys.platform == 'darwin':
         base = Path.home() / 'Library' / 'Application Support'
     else:
         base = env.get('XDG_CONFIG_HOME') or Path.home() / '.config'
-    return Path(base) / 'Claude'
+    return homes + [Path(base) / 'Claude']
+
+
+def desktop_home(env):
+    """有会话登记的那个数据目录；都没有时取老位置。"""
+    homes = desktop_homes(env)
+    return next((h for h in homes if (h / 'claude-code-sessions').is_dir()), homes[-1])
 
 
 def default_projects(env):
@@ -394,18 +409,29 @@ def caller_registry(env):
     """调用者环境里的会话登记目录 <账号>/<组织>（3.1）；不是桌面版 session 时为 None。"""
     account, org = env.get(ENV_ACCOUNT, ''), env.get(ENV_ORG, '')
     if PLAIN_ID.fullmatch(account) and PLAIN_ID.fullmatch(org):
-        return desktop_home(env) / 'claude-code-sessions' / account / org
+        paths = [home / 'claude-code-sessions' / account / org for home in desktop_homes(env)]
+        return next((p for p in paths if p.is_dir()), paths[-1])
     return None
 
 
 def registry_candidates(env):
     """本机的会话登记目录：调用者环境里的那个在前，其后是其余已有的。"""
-    first = [d for d in (caller_registry(env),) if d is not None]
-    try:
-        found = sorted(d for d in (desktop_home(env) / 'claude-code-sessions').glob('*/*') if d.is_dir())
-    except OSError:
-        found = []
-    return first + [d for d in found if d not in first]
+    out = [d for d in (caller_registry(env),) if d is not None]
+    for home in desktop_homes(env):
+        try:
+            found = sorted(d for d in (home / 'claude-code-sessions').glob('*/*') if d.is_dir())
+        except OSError:
+            found = []
+        out += [d for d in found if d not in out]
+    return out
+
+
+def notes_home(registry_dir, env):
+    """共享笔记的根目录：和会话登记在同一个桌面版数据目录下
+    （<数据目录>/claude-code-sessions/<账号>/<组织> → <数据目录>/side-session-notes）。"""
+    if registry_dir is not None and Path(registry_dir).parent.parent.name == 'claude-code-sessions':
+        return Path(registry_dir).parent.parent.parent / 'side-session-notes'
+    return desktop_home(env) / 'side-session-notes'
 
 
 def encode_cwd(path):
@@ -453,7 +479,6 @@ class Desktop:
         host, session = env.get(ENV_HOST, ''), env.get(ENV_SESSION, '')
         self.caller_host = host if LOCAL_ID.fullmatch(host) else None
         self.caller_cli = session if PLAIN_ID.fullmatch(session) else None
-        home = desktop_home(env)
         if family.get('registry_dir'):
             self.registry_dir = Path(family['registry_dir'])
         else:
@@ -462,7 +487,7 @@ class Desktop:
             self.registry_dir = next((d for d in registry_candidates(env) if any((d / (r + '.json')).is_file() for r in wanted)),
                                      caller_registry(env)) if wanted else caller_registry(env)
         self.projects_dir = Path(family['projects_dir']) if family.get('projects_dir') else default_projects(env)
-        self.notes_dir = Path(family['notes_dir']) if family.get('notes_dir') else home / 'side-session-notes'
+        self.notes_dir = Path(family['notes_dir']) if family.get('notes_dir') else notes_home(self.registry_dir, env)
         # 日志和笔记只认这两个目录里面的：不跟随链接与目录联接（含指向外面的子目录、文件）。
         self.projects_root, self.notes_root = real(self.projects_dir), real(self.notes_dir)
         self.entries, self.unreadable, self._dirs = {}, [], None
