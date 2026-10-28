@@ -15,11 +15,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from common import atomic, encode, inside, local_state, read_config
 import collector
 import transport
-from projection import ENV_HOST, ENV_SESSION, LOCAL_ID, VERSION, Desktop, mask, project, project_registry
+from projection import ENV_HOST, ENV_SESSION, LOCAL_ID, PLAIN_ID, CODEX_ENV, VERSION, Desktop, CodexDesktop, mask, project, project_registry
 
 # docs/multi-session.md 4.5：正式汇报只由主持 session 发。
 HOST_ONLY = '正式汇报只由主持 session 发：请把结果交回主持。'
-FAMILY_DIRS = ('registry_dir', 'projects_dir', 'notes_dir')
+FAMILY_DIRS = ('registry_dir', 'projects_dir', 'notes_dir', 'codex_dir')
 
 
 def bind(root, args):
@@ -52,21 +52,21 @@ def bind(root, args):
         if getattr(args, key):
             family[key] = str(Path(getattr(args, key)).resolve(strict=True))
     if roots or any(key in family for key in FAMILY_DIRS):
-        if cfg['framework'] != 'claude-code':
-            raise ValueError('A desktop session family can only be bound to a claude-code workspace')
-        desktop = Desktop(root, family, os.environ, roots)
+        desktop = (CodexDesktop if cfg['framework'] == 'codex' else Desktop)(root, family, os.environ, roots)
         for lid in roots:
-            if not LOCAL_ID.fullmatch(lid):
-                raise ValueError('A family root is a desktop session ID (local_...)')
+            if not (PLAIN_ID if cfg['framework'] == 'codex' else LOCAL_ID).fullmatch(lid):
+                raise ValueError('Codex 家族根必须是线程编号' if cfg['framework'] == 'codex' else 'A family root is a desktop session ID (local_...)')
             if lid not in desktop.entries:
-                raise ValueError('No desktop session registry for ' + lid + '; give --registry-dir')
-            if not desktop.at_workspace(lid):
+                raise ValueError(('找不到 Codex 线程 ' + lid + ' 的会话记录；请检查 --codex-dir 或 CODEX_HOME') if cfg['framework'] == 'codex'
+                                 else 'No desktop session registry for ' + lid + '; give --registry-dir')
+            if not desktop.at_workspace(lid) or isinstance(desktop, CodexDesktop) and desktop.subagent(lid):
                 raise ValueError(lid + ' does not run in this workspace; it cannot be a family root')
             if lid not in family['roots']:
                 family['roots'].append(lid)
         # Pin the registry found now, so an operator terminal without desktop variables finds it later.
-        if roots and not family.get('registry_dir'):
-            family['registry_dir'] = str(desktop.registry_dir)
+        directory = 'codex_dir' if cfg['framework'] == 'codex' else 'registry_dir'
+        if roots and not family.get(directory):
+            family[directory] = str(desktop.registry_dir)
         cfg['family'] = family
     atomic(path, encode(cfg))
     if args.add_family_root and not args.init:
@@ -91,16 +91,20 @@ def stray_worktree(root):
 
 def family_view(root, cfg):
     """桌面版的 session 图。没有绑定家族、也不是从 Claude Code 里调用时为 None，行为与 3.2 相同。"""
-    if cfg and cfg['framework'] != 'claude-code':
-        return None
     family = (cfg or {}).get('family') or {}
     saved = collector.saved_roots(root)
-    if not (family.get('roots') or saved or os.environ.get(ENV_HOST) or os.environ.get(ENV_SESSION)):
+    if not (family.get('roots') or saved or os.environ.get(ENV_HOST) or os.environ.get(ENV_SESSION) or cfg and cfg['framework'] == 'codex' and os.environ.get(CODEX_ENV)):
         return None
     try:
-        return Desktop(root, family, os.environ, saved)
-    except (OSError, ValueError, RecursionError):
-        return None
+        return (CodexDesktop if cfg and cfg['framework'] == 'codex' else Desktop)(root, family, os.environ, saved)
+    except Exception as exc:
+        # 发现不认识的类型或本机目录故障也不能阻断已有科研交付物。
+        if cfg and cfg['framework'] == 'codex':
+            from types import SimpleNamespace
+            return SimpleNamespace(discovery_error=type(exc).__name__)
+        if isinstance(exc, (OSError, ValueError, RecursionError)):
+            return None
+        raise
 
 
 def current_status(db, cfg, detail=False):
@@ -140,6 +144,24 @@ def main():
         masked = mask({'title': 'key sk-' + 'a'*24, 'sessionId': 'local_a'}, transport.SECRET_PATTERNS, '/registry', redaction)
         assert masked['title']['masked'] and masked['sessionId'] == 'local_a', 'registry text is masked in place'
         assert redaction == [{'path': '/registry/title', 'reason': 'secret_check'}]
+        delivery = {'type':'response_item','payload':{'type':'function_call_output','namespace':'codex_app',
+            'name':'create_thread','output':'<codex_delegation>' + '全文'*200 + '</codex_delegation>'}}
+        assert project(delivery)['native'] == delivery, 'Codex delivery must survive in full'
+        secret = dict(delivery['payload'], output='sk-' + 'a'*24)
+        assert project(secret, transport.SECRET_PATTERNS)['native']['output']['masked'], 'Codex delivery secrets are masked'
+        message = {'type':'agent_message','author':'/root/a','recipient':'/root','content':'交回'}
+        assert project(message)['native'] == message, 'Codex subagent addresses must survive'
+        metadata = {'content_item_kinds':['user.text'], 'turn_id':'t',
+                    'content_item_metadata':[{'provenance':{'type':'user','namespace':'n','hook':'h','private':1}}]}
+        value = project({'type':'message','role':'user','internal_chat_message_metadata_passthrough':metadata})['native']
+        assert value['internal_chat_message_metadata_passthrough']['content_item_metadata'][0]['provenance'] == {'type':'user','namespace':'n','hook':'h'}
+        code = 'x' * 300 + ';tools.mcp__codex_app__create_thread({});tools.mcp__codex_app__fork_thread({});'
+        call = project({'type':'custom_tool_call','name':'exec','input':code})['native']
+        assert call['codex_app_calls'] == ['create_thread', 'fork_thread'], 'Codex calls survive outside the input head'
+        output = [{'type':'input_text','text':'Script completed\nOutput:\n'}, {'type':'input_text','text':json.dumps(
+            {'content':[{'type':'text','text':json.dumps({'threadId':'fixture-thread','hostId':'local'})}]})}]
+        result = project({'type':'custom_tool_call_output','output':output})['native']
+        assert result['codex_app_results'] == [{'threadId':'fixture-thread'}], 'Codex thread results survive list output'
         print('runtime self-test OK (' + VERSION + ')')
         return 0
     root = Path(sys.argv[1]).resolve(strict=True)
@@ -153,6 +175,7 @@ def main():
     modes.add_argument('--add-family-root', action='append', default=[], help='追加绑定一个桌面版主持 session（local_…）')
     ap.add_argument('--family-root', action='append', default=[],
                     help='和 --init 一起：桌面版主持 session（local_…），它和它开出的 session 一起采集')
+    ap.add_argument('--codex-dir', help='Codex 会话记录目录（缺省 $CODEX_HOME 或 ~/.codex）')
     ap.add_argument('--registry-dir', help='桌面版会话登记目录（缺省：标准位置）')
     ap.add_argument('--projects-dir', help='Claude Code 日志根目录（缺省 ~/.claude/projects）')
     ap.add_argument('--notes-dir', help='共享笔记根目录（缺省：桌面版的 side-session-notes）')
@@ -180,7 +203,7 @@ def main():
         return 2
     cfg = read_config(root)
     desktop = None if args.status or args.check else family_view(root, cfg)
-    if desktop is not None:
+    if desktop is not None and not getattr(desktop, 'discovery_error', None):
         role, caller = desktop.classify(set(desktop.bound) | set(collector.saved_roots(root)))
         if role == 'member':
             print(HOST_ONLY + '（' + caller + ' 是本工作区主持开出来的 session，不是主持本身。）', file=sys.stderr)
@@ -213,13 +236,18 @@ def main():
         if args.restart_backfill:
             collector.restart_backfill(root, cfg, db)
         if args.status:
-            print(json.dumps(current_status(db, cfg, detail=True), ensure_ascii=False, indent=2))
+            status = current_status(db, cfg, detail=True)
+            print(json.dumps(status, ensure_ascii=False, indent=2))
+            if status['family'].get('missing_sources'):
+                print('这份会话记录在采完之前消失，可能被 Codex 迁进了历史库；之后的内容收不到。', file=sys.stderr)
             return 0
+        collector.mark_missing_sources(root, cfg, db)
         before = collector.status(db, cfg)
         bootstrapped = db.execute("SELECT value FROM meta WHERE key='bootstrapped'").fetchone()
         # Only operator-bound sources gate collection; family sources are backfilled automatically.
-        source_ready = not before['uninitialized_sources'] and all(s['baseline_done'] for s in before['sources'])
-        if not args.backfill and (not bootstrapped or not source_ready):
+        source_ready = not before['uninitialized_sources'] and all(s['baseline_done'] or cfg['framework'] == 'codex' and s['error'] == collector.MISSING for s in before['sources'])
+        ended_missing = cfg['framework'] == 'codex' and any(s['error'] == collector.MISSING for s in before['sources'])
+        if not args.backfill and ((not bootstrapped and not ended_missing) or not source_ready):
             print('首次回填/来源重建尚未完成；请操作者继续 --backfill。')
             return transport.publish(args.message)
         family = collector.discover(root, cfg, db, desktop) if desktop is not None else None
@@ -243,11 +271,13 @@ def main():
         current['publish_seconds'] = time.monotonic()-started
         atomic(inside(root, local_state(root) / 'status.json'), encode(current))
         print(json.dumps(current, ensure_ascii=False, indent=2))
+        if current['family'].get('missing_sources'):
+            print('这份会话记录在采完之前消失，可能被 Codex 迁进了历史库；之后的内容收不到。', file=sys.stderr)
         if current['family']['blocked']:
             print('会话登记或共享笔记命中秘密检查，留在本地没有上传：' + '、'.join(current['family']['blocked']), file=sys.stderr)
         if result:
             return result
-        return 2 if any(s['error'] for s in current['sources']) or current['family']['errors'] or current['family']['blocked'] else 0
+        return 2 if any(s['error'] and not (cfg['framework'] == 'codex' and s['error'] == collector.MISSING) for s in current['sources']) or current['family']['errors'] or current['family']['blocked'] else 0
     finally:
         db.close()
 

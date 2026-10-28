@@ -12,7 +12,7 @@ import zlib
 
 from common import atomic, encode, inside, local_state
 from projection import (NOTE_TEXT_BYTES, NOTE_TEXT_SUFFIXES, VERSION, check_text, mask, project, project_note,
-                        project_registry, real, within)
+                        project_registry, real, within, codex_header)
 
 MAX_RECORD = 64 * 1024 * 1024
 MAX_EXPANDED = 64 * 1024 * 1024
@@ -140,7 +140,8 @@ def source_path(root, source):
 def observe(db, cfg, src, kind, **extra):
     event = dict(schema='mp-source-observation/1', run_id=cfg['run_id'],
                  publisher_id=cfg['publisher_id'], source_id=src['id'], generation=src['generation'],
-                 observation=kind, collected_at=time.time(), projection_version=VERSION, **extra)
+                 observation=kind, collected_at=time.time(), projection_version=VERSION,
+                 **({'framework': 'codex-desktop'} if cfg['framework'] == 'codex' else {}), **extra)
     db.execute('INSERT INTO observations(data) VALUES (?)', (encode(event),))
 
 
@@ -167,15 +168,39 @@ def initialize(root, cfg, db):
             generation = uuid.uuid4().hex
             db.execute('INSERT INTO sources(id,path,generation,identity,snapshot_end,observed_size) VALUES (?,?,?,?,?,?)',
                        (src['id'], str(path), generation, identity(stat), stat.st_size, stat.st_size))
+            header = codex_header(path) if cfg['framework'] == 'codex' else None
             observe(db, cfg, dict(src, generation=generation), 'initial_snapshot',
-                    source_name=path.name, observed_bytes=stat.st_size, snapshot_end=stat.st_size)
+                    source_name=path.name, observed_bytes=stat.st_size, snapshot_end=stat.st_size,
+                    **({'cli_session_id': header['id']} if header else {}))
+
+
+def source_finished(row, framework):
+    """Codex 迁走的显式来源已结束等待，保留缺失观察而不堵住整个 run。"""
+    return bool(row['baseline_done'] and not row['error'] or framework == 'codex' and row['error'] == MISSING)
+
+
+def mark_missing_sources(root, cfg, db):
+    """普通 publish 在首次回填门限之前也要发现显式 Codex 来源消失。"""
+    if cfg['framework'] != 'codex':
+        return
+    explicit = {s['id'] for s in cfg['sources']}
+    with db:
+        for row in db.execute('SELECT * FROM sources').fetchall():
+            if row['id'] not in explicit or row['error'] == MISSING or os.path.exists(row['path']):
+                continue
+            extra = dict(last_observed_size=row['observed_size'])
+            if row['cursor'] < row['observed_size']:
+                extra['reason'] = 'codex_migration_suspected'
+            observe(db, cfg, row, 'source_missing', committed_cursor=row['cursor'], **extra)
+            db.execute('UPDATE sources SET error=? WHERE id=?', (MISSING, row['id']))
 
 
 def restart_backfill(root, cfg, db):
     with db:
         rows = {r['id']: dict(r, _table='sources') for r in db.execute('SELECT * FROM sources ORDER BY rowid')}
         explicit = {s['id'] for s in cfg['sources']}
-        targets = [(rows[s['id']], s) for s in cfg['sources']]
+        targets = [(rows[s['id']], s) for s in cfg['sources']
+                   if cfg['framework'] != 'codex' or os.path.exists(s['path'])]
         # 家族发现的来源一并重采集：操作者已经绑定的不重复（否则留下孤儿代次），日志已经不在的跳过。
         targets += [(old, old) for old in family_rows(db) if old['id'] not in explicit and os.path.exists(old['path'])]
         for old, src in targets:
@@ -270,6 +295,11 @@ def discover(root, cfg, db, desktop):
     秘密检查：登记里的文字就地遮盖、照常发送；笔记正文命中只发清单。遮盖之后仍有命中（例如笔记的
     文件名）的那一条才留在本地，列进 blocked。意外的错误不挡住交付：记一条观察，这一次跳过家族发现。"""
     try:
+        if getattr(desktop, 'discovery_error', None):
+            with db:
+                observe(db, cfg, dict(id='registry:', generation=None), 'family_discovery_failed',
+                        error_type=desktop.discovery_error)
+            return dict(error=desktop.discovery_error)
         return _discover(root, cfg, db, desktop)
     except sqlite3.Error:
         raise
@@ -278,7 +308,8 @@ def discover(root, cfg, db, desktop):
             db.execute('INSERT INTO observations(data) VALUES (?)', (encode(dict(
                 schema='mp-source-observation/1', run_id=cfg['run_id'], publisher_id=cfg['publisher_id'],
                 source_id='registry:', generation=None, observation='family_discovery_failed',
-                error_type=type(exc).__name__, collected_at=time.time(), projection_version=VERSION)),))
+                error_type=type(exc).__name__, collected_at=time.time(), projection_version=VERSION,
+                **({'framework': 'codex-desktop'} if cfg['framework'] == 'codex' else {}))),))
         return dict(error=type(exc).__name__)
 
 
@@ -295,13 +326,14 @@ def _discover(root, cfg, db, desktop):
     ids = {r['id'] for r in rows} | {s['id'] for s in cfg['sources']}
     known = {os.path.normcase(p) for p in [r['path'] for r in rows] + [s['path'] for s in cfg['sources']]}
     old_blocked, blocked, now = state['blocked'], {}, time.time()
-    envelope = dict(run_id=cfg['run_id'], publisher_id=cfg['publisher_id'], framework='claude-desktop', observed_at=now)
+    envelope = dict(run_id=cfg['run_id'], publisher_id=cfg['publisher_id'], framework=getattr(desktop, 'framework', 'claude-desktop'), observed_at=now)
     summary = dict(roots=[r for r, _ in roots], members=0, outside=0, new_sources=0, records=0, masked=0)
 
     def notice(source_id, kind, **extra):
         db.execute('INSERT INTO observations(data) VALUES (?)', (encode(dict(
             schema='mp-source-observation/1', run_id=cfg['run_id'], publisher_id=cfg['publisher_id'],
-            source_id=source_id, generation=None, observation=kind, collected_at=now, projection_version=VERSION, **extra)),))
+            source_id=source_id, generation=None, observation=kind, collected_at=now, projection_version=VERSION,
+            **({'framework': 'codex-desktop'} if cfg['framework'] == 'codex' else {}), **extra)),))
 
     def queue(key, digest, event):
         raw = encode(event)
@@ -327,8 +359,14 @@ def _discover(root, cfg, db, desktop):
             state['unreadable'] = unreadable
         for lid, relation, parent in desktop.members(roots):
             if lid not in desktop.entries:
+                if getattr(desktop, 'include_outside', False):
+                    key = 'unavailable:' + lid
+                    if key not in state['seen']:
+                        notice('registry:' + lid, 'family_member_unavailable', desktop_session=lid,
+                               parent_session=parent, relation=relation, reason='not_local_or_migrated')
+                        state['seen'][key] = True
                 continue
-            if not desktop.inside(lid):
+            if not desktop.inside(lid) and not getattr(desktop, 'include_outside', False):
                 summary['outside'] += 1
                 if lid not in state['outside']:
                     state['outside'].append(lid)
@@ -338,6 +376,8 @@ def _discover(root, cfg, db, desktop):
             if lid in state['outside']:
                 state['outside'].remove(lid)
             summary['members'] += 1
+            if not desktop.inside(lid):
+                summary['outside'] += 1
             for kind, cid, path in desktop.logs(lid, [desktop.caller_cli] if lid == caller and desktop.caller_cli else []):
                 try:
                     path = source_path(root, {'path': str(path)})
@@ -353,14 +393,19 @@ def _discover(root, cfg, db, desktop):
                 generation = uuid.uuid4().hex
                 db.execute('INSERT INTO family_sources(id,path,generation,identity,snapshot_end,observed_size) VALUES (?,?,?,?,?,?)',
                            (sid, str(path), generation, identity(stat), stat.st_size, stat.st_size))
+                parent_id = (desktop.parents(cid)[:1] or [('', lid)])[0][1] if kind == 'subagent' else parent
+                if kind == 'subagent' and getattr(desktop, 'include_outside', False):
+                    parent_id = desktop.owner(cid)  # 多级子任务的观察指向所属道，原始直接父仍在会话头中。
                 observe(db, cfg, dict(id=sid, generation=generation), 'family_source_discovered',
                         source_name=path.name, observed_bytes=stat.st_size, snapshot_end=stat.st_size,
-                        desktop_session=lid, relation=relation, parent_session=parent, log_kind=kind, cli_session_id=cid)
+                        desktop_session=lid, relation='thread_spawn.parent_thread_id' if kind == 'subagent' else relation,
+                        parent_session=parent_id, log_kind=kind, cli_session_id=cid,
+                        **({'outside_workspace': True} if getattr(desktop, 'include_outside', False) and not desktop.inside(cid) else {}))
                 ids.add(sid)
                 known.add(os.path.normcase(str(path)))
                 state['sources'][sid] = lid
                 summary['new_sources'] += 1
-            registry, unrecognized = project_registry(desktop.entries[lid])
+            registry, unrecognized = project_registry(desktop.entries[lid], codex=getattr(desktop, 'include_outside', False))
             redaction = []
             # 关系字段不能因为一段文字整条丢掉：命中的文字像 assistant 正文那样就地遮盖。
             registry = mask(registry, SECRET_PATTERNS, '/registry', redaction)
@@ -373,7 +418,20 @@ def _discover(root, cfg, db, desktop):
                     event['redaction'] = redaction
                     summary['masked'] += 1
                 queue(key, digest, event)
-        for lid, _ in roots:
+        if getattr(desktop, 'include_outside', False):
+            for name in ('unknown', 'mismatched'):
+                count = len(getattr(desktop, name, ()))
+                key = 'codex_' + name
+                if count and state['seen'].get(key) != count:
+                    notice('registry:', key + '_structure', count=count)
+                state['seen'][key] = count
+            for name, count in desktop.known_results.items():
+                key = 'codex_' + name
+                mark = sha(encode(sorted(desktop.pending_continuations))) if name == 'continuation_pending' else count
+                if count and state['seen'].get(key) != mark:
+                    notice('registry:', key, count=count)
+                state['seen'][key] = mark
+        for lid, _ in ([] if getattr(desktop, 'include_outside', False) else roots):
             prefix = 'notes:' + lid + '/'
             present = set()
             files, truncated, unreadable = note_files(desktop.notes_folder(lid), desktop.notes_root)
@@ -476,6 +534,8 @@ class Stream:
         self.expanded += len(raw)
 
     def event(self, event):
+        if self.cfg['framework'] == 'codex' and event.get('schema') == 'mp-source-observation/1':
+            event['framework'] = 'codex-desktop'  # 包括扫描器直接产生的缺失、快照、增量、换代与错误观察。
         event['publisher_release'] = PUBLISHER_RELEASE
         raw = encode(event)
         if len(raw) > FRAGMENT_BYTES * 1024:
@@ -580,6 +640,21 @@ def collect(root, cfg, db, backfill, seconds=0, byte_budget=None,
     stream = Stream(root, cfg, db, states, chunk_bytes, checkpoint_seconds)
     read_bytes = 0
     budget_end = family_end = False
+    def missing_source(src):
+        if src['error'] != MISSING:
+            extra = {}
+            if cfg['framework'] == 'codex':
+                src['observed_size'] = max(src['observed_size'], ends.get(src['id']) or 0)
+                extra['last_observed_size'] = src['observed_size']
+                if src['cursor'] < src['observed_size']:
+                    extra['reason'] = 'codex_migration_suspected'
+            src['error'] = MISSING
+            stream.dirty = True
+            stream.event(dict(schema='mp-source-observation/1', run_id=cfg['run_id'],
+                publisher_id=cfg['publisher_id'], source_id=src['id'], generation=src['generation'],
+                observation='source_missing', committed_cursor=src['cursor'],
+                collected_at=time.time(), projection_version=VERSION, **extra))
+
     try:
         for row in db.execute('SELECT * FROM observations ORDER BY id').fetchall():
             stream.event(json.loads(row['data']))
@@ -589,15 +664,8 @@ def collect(root, cfg, db, backfill, seconds=0, byte_budget=None,
             src = states[sid]
             snapshot = not src['baseline_done']
             automatic = snapshot and not backfill
-            if sid in found and not os.path.exists(src['path']):
-                # A family log removed later (e.g. framework cleanup): recorded once, never an error.
-                if src['error'] != MISSING:
-                    src['error'] = MISSING
-                    stream.dirty = True
-                    stream.event(dict(schema='mp-source-observation/1', run_id=cfg['run_id'],
-                        publisher_id=cfg['publisher_id'], source_id=src['id'], generation=src['generation'],
-                        observation='source_missing', committed_cursor=src['cursor'],
-                        collected_at=time.time(), projection_version=VERSION))
+            if (sid in found or cfg['framework'] == 'codex') and not os.path.exists(src['path']):
+                missing_source(src)
                 continue
             if time.perf_counter() >= limit:
                 if automatic:
@@ -628,6 +696,8 @@ def collect(root, cfg, db, backfill, seconds=0, byte_budget=None,
                         continue
                     if ends[src['id']] is None:
                         raise ValueError('Source was unavailable at scan start; retry required')
+                    if cfg['framework'] == 'codex':
+                        src['observed_size'] = stat.st_size
                     end = min(stat.st_size, src['snapshot_end']) if snapshot else min(stat.st_size, ends[src['id']])
                     start_cursor = cursor = src['cursor']
                     fh.seek(0)
@@ -689,6 +759,9 @@ def collect(root, cfg, db, backfill, seconds=0, byte_budget=None,
                             budget_end = True
                         break
             except (OSError, ValueError, RecursionError) as exc:
+                if cfg['framework'] == 'codex' and isinstance(exc, FileNotFoundError):
+                    missing_source(src)
+                    continue
                 error = 'invalid JSON record' if isinstance(exc, json.JSONDecodeError) else str(exc)
                 src['error'] = type(exc).__name__ + ': ' + error[:240]
                 stream.dirty = True
@@ -700,7 +773,7 @@ def collect(root, cfg, db, backfill, seconds=0, byte_budget=None,
     finally:
         stream.close()
     # The operator's first backfill covers the explicitly bound sources; family ones follow by themselves.
-    ready = bool(explicit) and all(states[sid]['baseline_done'] and not states[sid]['error'] for sid in explicit)
+    ready = bool(explicit) and all(source_finished(states[sid], cfg['framework']) for sid in explicit)
     if ready:
         with db:
             db.execute("INSERT OR REPLACE INTO meta VALUES ('bootstrapped','1')")
@@ -727,9 +800,14 @@ def status(db, cfg, detail=False):
                   errors=[dict(id=r['id'], path=r['path'], error=r['error']) for r in found if r['error'] not in (None, MISSING, CHANGED_AGAIN)],
                   blocked=sorted(shown(key, SECRET_PATTERNS) for key in state['blocked']),
                   registry=dict(available=not state['unavailable'], unreadable=len(state['unreadable'])))
+    if cfg['framework'] == 'codex':
+        family['missing_sources'] = [dict(id=r['id'], path=r['path'], cursor=r['cursor'],
+            last_observed_size=r['observed_size'], reason='codex_migration_suspected')
+            for r in rows + found if r['error'] == MISSING and r['cursor'] < r['observed_size']]
+        family['missing'] = len(family['missing_sources'])
     if detail:
         family['collected'] = [r['path'] for r in found if r['error'] != MISSING]
-    settled = all(r['baseline_done'] and not r['error'] for r in rows) and \
+    settled = all(source_finished(r, cfg['framework']) for r in rows) and \
         all(r['error'] == MISSING or r['baseline_done'] and not r['error'] for r in found)
     return dict(sources=[{k: v for k, v in r.items() if k != 'path'} for r in rows], uninitialized_sources=missing,
                 state_version=version, migration_required=version==1, local_pending_chunks=pending,
